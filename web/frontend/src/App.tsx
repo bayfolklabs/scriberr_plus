@@ -7,6 +7,7 @@ const AudioDetailView = lazy(() => import("@/features/transcription/components/A
 const Settings = lazy(() => import('@/features/settings/pages/SettingsPage').then(module => ({ default: module.Settings })))
 const CLISettings = lazy(() => import('@/features/settings/pages/CLISettingsPage').then(module => ({ default: module.CLISettings })))
 const CLIAuthConfirmation = lazy(() => import('./features/auth/components/CLIAuthConfirmation').then(module => ({ default: module.CLIAuthConfirmation })))
+const LiveMeetingPage = lazy(() => import("@/features/live/LiveMeetingPage").then(module => ({ default: module.LiveMeetingPage })));
 
 
 // Loading component
@@ -22,6 +23,7 @@ function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/audio/:audioId" element={<AudioDetailView />} />
+        <Route path="/live" element={<LiveMeetingPage />} />
 
         <Route path="/settings" element={<Settings />} />
         <Route path="/settings/cli" element={<CLISettings />} />

@@ -258,6 +258,10 @@ func GinLogger() gin.HandlerFunc {
 				return // Skip status polling
 			case path == "/api/v1/transcription/list" || path == "/health":
 				return // Skip frequent list calls
+			case strings.HasPrefix(path, "/api/v1/live/sessions/") &&
+				(strings.Contains(path, "/chunks") || strings.Contains(path, "/state")) &&
+				c.Writer.Status() < 400:
+				return // Skip per-second live chunk uploads and state polling (errors are still logged)
 			}
 		}
 

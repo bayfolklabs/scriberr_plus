@@ -12,6 +12,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { ToastProvider } from '@/components/ui/toast'
 import { ChatEventsProvider } from './contexts/ChatEventsContext'
 import { GlobalUploadProvider } from './contexts/GlobalUploadContext'
+import { LiveSessionProvider } from './features/live/LiveSessionProvider'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { setupAuthInterceptor } from './lib/authInterceptor'
 
@@ -28,11 +29,14 @@ createRoot(document.getElementById('root')!).render(
           <TooltipProvider>
             <ToastProvider>
               <ChatEventsProvider>
-                <ProtectedRoute>
-                  <GlobalUploadProvider>
-                    <App />
-                  </GlobalUploadProvider>
-                </ProtectedRoute>
+                {/* Above the auth gate and the routes: a live meeting keeps recording across navigation */}
+                <LiveSessionProvider>
+                  <ProtectedRoute>
+                    <GlobalUploadProvider>
+                      <App />
+                    </GlobalUploadProvider>
+                  </ProtectedRoute>
+                </LiveSessionProvider>
               </ChatEventsProvider>
             </ToastProvider>
           </TooltipProvider>

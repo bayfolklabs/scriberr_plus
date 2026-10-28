@@ -158,6 +158,22 @@ func SetupRoutes(handler *Handler, authService *auth.AuthService) *gin.Engine {
 			transcription.GET("/quick/:id", handler.GetQuickTranscriptionStatus)
 		}
 
+		// Live session routes (require authentication) - disable compression for these.
+		// Registered only when LIVE_ENABLED is not false.
+		if handler.liveManager != nil {
+			liveRoutes := v1.Group("/live")
+			liveRoutes.Use(middleware.AuthMiddleware(authService))
+			liveRoutes.Use(middleware.NoCompressionMiddleware())
+			{
+				liveRoutes.POST("/sessions", handler.CreateLiveSession)
+				liveRoutes.GET("/sessions", handler.ListLiveSessions)
+				liveRoutes.POST("/sessions/:id/chunks", handler.AppendLiveChunk)
+				liveRoutes.GET("/sessions/:id/state", handler.GetLiveSessionState)
+				liveRoutes.POST("/sessions/:id/stop", handler.StopLiveSession)
+				liveRoutes.POST("/sessions/:id/finalize", handler.FinalizeLiveSession)
+			}
+		}
+
 		// Profile routes (require authentication)
 		profiles := v1.Group("/profiles")
 		profiles.Use(middleware.AuthMiddleware(authService))

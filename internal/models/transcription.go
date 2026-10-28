@@ -28,6 +28,13 @@ type TranscriptionJob struct {
 	UpdatedAt             time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt             gorm.DeletedAt `json:"deleted_at,omitempty" gorm:"index" swaggertype:"string"`
 
+	// Live session fields (see LIVE_DESIGN.md)
+	Source           string  `json:"source" gorm:"type:varchar(20);default:'upload';index"`     // upload, live
+	LiveStatus       string  `json:"live_status" gorm:"type:varchar(20);default:'none';index"`  // none, recording, interrupted, finalizing, finalized, failed
+	LiveTranscript   *string `json:"-" gorm:"type:text"`                                        // TranscriptResult JSON of the live pass; never cleared by re-transcription
+	TranscriptSource string  `json:"transcript_source" gorm:"type:varchar(20);default:'batch'"` // which pass currently fills Transcript: live, batch
+	RecordingPath    *string `json:"recording_path,omitempty" gorm:"type:text"`                 // raw append-only recording.webm
+
 	// WhisperX parameters
 	Parameters WhisperXParams `json:"parameters" gorm:"embedded"`
 
@@ -44,6 +51,22 @@ const (
 	StatusProcessing JobStatus = "processing"
 	StatusCompleted  JobStatus = "completed"
 	StatusFailed     JobStatus = "failed"
+)
+
+// Job sources, live session states and transcript sources
+const (
+	SourceUpload = "upload"
+	SourceLive   = "live"
+
+	LiveStatusNone        = "none"
+	LiveStatusRecording   = "recording"
+	LiveStatusInterrupted = "interrupted"
+	LiveStatusFinalizing  = "finalizing"
+	LiveStatusFinalized   = "finalized"
+	LiveStatusFailed      = "failed"
+
+	TranscriptSourceLive  = "live"
+	TranscriptSourceBatch = "batch"
 )
 
 // WhisperXParams contains parameters for WhisperX transcription
@@ -141,6 +164,15 @@ func (tj *TranscriptionJob) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
+// BeforeSave keeps TranscriptSource honest when a live session is re-transcribed:
+// a pending job whose transcript was cleared will be filled by the batch pass.
+func (tj *TranscriptionJob) BeforeSave(tx *gorm.DB) error {
+	if tj.TranscriptSource == TranscriptSourceLive && tj.Status == StatusPending && tj.Transcript == nil {
+		tj.TranscriptSource = TranscriptSourceBatch
+	}
+	return nil
+}
+
 // User represents a user for authentication
 type User struct {
 	ID                       uint      `json:"id" gorm:"primaryKey"`
@@ -207,10 +239,10 @@ func (tp *TranscriptionProfile) BeforeSave(tx *gorm.DB) error {
 // LLMConfig represents LLM configuration settings
 type LLMConfig struct {
 	ID            uint      `json:"id" gorm:"primaryKey"`
-	Provider      string    `json:"provider" gorm:"not null;type:varchar(50)"` // "ollama" or "openai"
-	BaseURL       *string   `json:"base_url,omitempty" gorm:"type:text"`       // For Ollama
+	Provider      string    `json:"provider" gorm:"not null;type:varchar(50)"`  // "ollama" or "openai"
+	BaseURL       *string   `json:"base_url,omitempty" gorm:"type:text"`        // For Ollama
 	OpenAIBaseURL *string   `json:"openai_base_url,omitempty" gorm:"type:text"` // For OpenAI custom endpoint
-	APIKey        *string   `json:"api_key,omitempty" gorm:"type:text"`        // For OpenAI (encrypted)
+	APIKey        *string   `json:"api_key,omitempty" gorm:"type:text"`         // For OpenAI (encrypted)
 	IsActive      bool      `json:"is_active" gorm:"type:boolean;default:false"`
 	CreatedAt     time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt     time.Time `json:"updated_at" gorm:"autoUpdateTime"`

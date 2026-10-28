@@ -6,7 +6,7 @@ import {
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Upload, Mic, Settings, LogOut, Home, Plus, Grip, Zap, Youtube, Video, Users, MonitorSpeaker } from "lucide-react";
+import { Upload, Mic, Settings, LogOut, Home, Plus, Grip, Zap, Youtube, Video, Users, MonitorSpeaker, Radio } from "lucide-react";
 import { ScriberrLogo } from "./ScriberrLogo";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { AudioRecorder } from "./AudioRecorder";
@@ -17,6 +17,7 @@ import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/features/auth/hooks/useAuth";
 import { isVideoFile, isAudioFile } from "../utils/fileProcessor";
 import { useGlobalUpload } from "@/contexts/GlobalUploadContext";
+import { LiveIndicator } from "@/features/live/LiveIndicator";
 
 interface FileWithType {
 	file: File;
@@ -61,6 +62,10 @@ export function Header({ onFileSelect, onMultiTrackClick, onDownloadComplete }: 
 
 	const handleSystemRecordClick = () => {
 		setIsSystemRecorderOpen(true);
+	};
+
+	const handleLiveMeetingClick = () => {
+		navigate("/live");
 	};
 
 	const handleQuickTranscriptionClick = () => {
@@ -143,6 +148,9 @@ export function Header({ onFileSelect, onMultiTrackClick, onDownloadComplete }: 
 
 				{/* Right side - Plus (Add Audio), Grip Menu, Theme Switcher */}
 				<div className="flex items-center gap-2 sm:gap-3">
+					{/* Live meeting indicator (only while a meeting records, uploads or needs recovery) */}
+					<LiveIndicator />
+
 					{/* Add Audio (icon-only) */}
 					<DropdownMenu>
 						<DropdownMenuTrigger asChild>
@@ -159,6 +167,20 @@ export function Header({ onFileSelect, onMultiTrackClick, onDownloadComplete }: 
 							align="end"
 							className="w-64 glass-card p-2 rounded-[var(--radius-card)] shadow-[var(--shadow-float)] border-[var(--border-subtle)]"
 						>
+							<DropdownMenuItem
+								onClick={handleLiveMeetingClick}
+								className="group flex items-center gap-3 px-3 py-3 cursor-pointer rounded-[var(--radius-btn)] focus:bg-[var(--brand-light)] focus:text-[var(--brand-solid)] transition-colors"
+							>
+								<div className="p-2 bg-red-500/10 rounded-[var(--radius-btn)] text-red-600 group-focus:text-[var(--brand-solid)]">
+									<Radio className="h-4 w-4" />
+								</div>
+								<div>
+									<div className="font-medium text-sm">Live Meeting</div>
+									<div className="text-xs text-[var(--text-secondary)]">
+										Transcribe as you record
+									</div>
+								</div>
+							</DropdownMenuItem>
 							<DropdownMenuItem
 								onClick={handleQuickTranscriptionClick}
 								className="group flex items-center gap-3 px-3 py-3 cursor-pointer rounded-[var(--radius-btn)] focus:bg-[var(--brand-light)] focus:text-[var(--brand-solid)] transition-colors"
@@ -276,6 +298,10 @@ export function Header({ onFileSelect, onMultiTrackClick, onDownloadComplete }: 
 							<DropdownMenuItem onClick={handleHomeClick} className="cursor-pointer rounded-[var(--radius-btn)] focus:bg-[var(--secondary)] py-2.5">
 								<Home className="h-4 w-4 mr-2" />
 								Home
+							</DropdownMenuItem>
+							<DropdownMenuItem onClick={handleLiveMeetingClick} className="cursor-pointer rounded-[var(--radius-btn)] focus:bg-[var(--secondary)] py-2.5">
+								<Radio className="h-4 w-4 mr-2" />
+								Live meeting
 							</DropdownMenuItem>
 							<DropdownMenuItem onClick={handleSettingsClick} className="cursor-pointer rounded-[var(--radius-btn)] focus:bg-[var(--secondary)] py-2.5">
 								<Settings className="h-4 w-4 mr-2" />

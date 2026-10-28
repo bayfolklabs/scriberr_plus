@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"scriberr/pkg/logger"
@@ -45,6 +46,14 @@ type Config struct {
 	// EnabledAdapters limits which model adapters are registered (and therefore
 	// set up at startup). Empty means all adapters, matching upstream behavior.
 	EnabledAdapters []string
+
+	// Live transcription configuration (see LIVE_DESIGN.md)
+	LiveEnabled        bool   // LIVE_ENABLED: false removes the /api/v1/live routes
+	LiveEngine         string // LIVE_ENGINE: worker engine
+	LiveThreads        int    // LIVE_THREADS: ONNX threads for the worker
+	LiveModelsDir      string // LIVE_MODELS_DIR: model archives
+	LiveAbandonMinutes int    // LIVE_ABANDON_MINUTES: auto-finalize interrupted sessions
+	LiveWorkerCmd      string // LIVE_WORKER_CMD: full worker command line override (tests, fake workers)
 }
 
 // Load loads configuration from environment variables and .env file
@@ -75,6 +84,13 @@ func Load() *Config {
 		OpenAIAPIKey:    getEnv("OPENAI_API_KEY", ""),
 		HFToken:         getEnv("HF_TOKEN", ""),
 		EnabledAdapters: splitList(getEnv("SCRIBERR_ADAPTERS", "")),
+
+		LiveEnabled:        strings.ToLower(getEnv("LIVE_ENABLED", "true")) != "false",
+		LiveEngine:         getEnv("LIVE_ENGINE", "nemotron-en-1120ms"),
+		LiveThreads:        getEnvInt("LIVE_THREADS", 4),
+		LiveModelsDir:      getEnv("LIVE_MODELS_DIR", "data/live-models"),
+		LiveAbandonMinutes: getEnvInt("LIVE_ABANDON_MINUTES", 30),
+		LiveWorkerCmd:      getEnv("LIVE_WORKER_CMD", ""),
 	}
 }
 
@@ -111,6 +127,14 @@ func splitList(value string) []string {
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+// getEnvInt gets a positive integer environment variable with a default value
+func getEnvInt(key string, defaultValue int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key))); err == nil && n > 0 {
+		return n
 	}
 	return defaultValue
 }

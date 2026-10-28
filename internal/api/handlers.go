@@ -17,6 +17,7 @@ import (
 
 	"scriberr/internal/auth"
 	"scriberr/internal/config"
+	"scriberr/internal/live"
 	"scriberr/internal/models"
 	"scriberr/internal/processing"
 	"scriberr/internal/queue"
@@ -52,6 +53,16 @@ type Handler struct {
 	quickTranscription  *transcription.QuickTranscriptionService
 	multiTrackProcessor *processing.MultiTrackProcessor
 	broadcaster         *sse.Broadcaster
+	liveManager         *live.Manager // nil when LIVE_ENABLED=false
+}
+
+// SetLiveManager enables the /api/v1/live routes (call it before SetupRoutes) and
+// wires auto re-transcription of finalized live sessions to the normal queue.
+func (h *Handler) SetLiveManager(m *live.Manager) {
+	h.liveManager = m
+	if m != nil {
+		m.SetRetranscriber(h.enqueueLiveRetranscription)
+	}
 }
 
 // NewHandler creates a new handler
@@ -848,6 +859,27 @@ func (h *Handler) GetTranscript(c *gin.Context) {
 		return
 	}
 
+	// A live session keeps showing its live transcript while a high-quality
+	// re-transcription is pending, processing or failed.
+	if job.LiveTranscript != nil && (job.Status == models.StatusPending ||
+		job.Status == models.StatusProcessing || job.Status == models.StatusFailed) {
+		var transcript interface{}
+		if err := json.Unmarshal([]byte(*job.LiveTranscript), &transcript); err == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"job_id":            job.ID,
+				"title":             job.Title,
+				"transcript":        transcript,
+				"status":            job.Status,
+				"available":         true,
+				"transcript_source": models.TranscriptSourceLive,
+				"message":           fmt.Sprintf("Showing the live transcript, re-transcription status: %s", job.Status),
+				"created_at":        job.CreatedAt,
+				"updated_at":        job.UpdatedAt,
+			})
+			return
+		}
+	}
+
 	// Return empty transcript gracefully for non-completed jobs
 	if job.Status != models.StatusCompleted {
 		c.JSON(http.StatusOK, gin.H{
@@ -1259,6 +1291,15 @@ func (h *Handler) DeleteTranscriptionJob(c *gin.Context) {
 		return
 	}
 
+	// Live sessions: refuse while recording, otherwise remove the session directory
+	// (raw recording, chunk index, worker log) and live segments
+	if h.liveManager != nil {
+		if err := h.liveManager.Remove(c.Request.Context(), job); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	// Delete files
 	if job.IsMultiTrack && job.MultiTrackFolder != nil {
 		_ = h.fileService.RemoveDirectory(*job.MultiTrackFolder)
@@ -1462,8 +1503,12 @@ func (h *Handler) GetAudioFile(c *gin.Context) {
 		c.Header("Content-Type", "audio/wav")
 	case ".m4a":
 		c.Header("Content-Type", "audio/mp4")
-	case ".ogg":
+	case ".ogg", ".opus":
 		c.Header("Content-Type", "audio/ogg")
+	case ".webm":
+		c.Header("Content-Type", "audio/webm")
+	case ".flac":
+		c.Header("Content-Type", "audio/flac")
 	default:
 		c.Header("Content-Type", "audio/mpeg")
 	}

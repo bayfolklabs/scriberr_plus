@@ -15,6 +15,7 @@ import (
 	"scriberr/internal/auth"
 	"scriberr/internal/config"
 	"scriberr/internal/database"
+	"scriberr/internal/live"
 	"scriberr/internal/processing"
 	"scriberr/internal/queue"
 	"scriberr/internal/repository"
@@ -119,6 +120,19 @@ func main() {
 	unifiedProcessor := transcription.NewUnifiedJobProcessor(jobRepo, cfg.TempDir, cfg.TranscriptsDir)
 	unifiedProcessor.GetUnifiedService().SetBroadcaster(broadcaster)
 
+	// Initialize live sessions: sessions cut off by a restart become resumable
+	// ('interrupted'), and the live ASR environment is prepared in the background
+	// so startup never waits for it.
+	var liveManager *live.Manager
+	if cfg.LiveEnabled {
+		logger.Startup("live", "Initializing live sessions")
+		liveManager = live.NewManager(database.DB, live.OptionsFromConfig(cfg))
+		if err := liveManager.Recover(context.Background()); err != nil {
+			logger.Warn("Live session recovery failed", "error", err)
+		}
+		liveManager.PrepareEnvironment()
+	}
+
 	// Bootstrap embedded Python environment (for all adapters)
 	logger.Startup("python", "Preparing Python environment")
 	if err := unifiedProcessor.InitEmbeddedPythonEnv(); err != nil {
@@ -165,6 +179,10 @@ func main() {
 		multiTrackProcessor,
 		broadcaster,
 	)
+	if liveManager != nil {
+		handler.SetLiveManager(liveManager)
+		liveManager.Start() // janitor and resumed finalizations (needs the re-transcription hook)
+	}
 
 	// Set up router
 	router := api.SetupRoutes(handler, authService)
@@ -207,8 +225,16 @@ func main() {
 	}
 
 	// Gracefully shutdown the server
-	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("Server forced to shutdown", "error", err)
+	shutdownErr := srv.Shutdown(ctx)
+
+	// Stop live pipelines (ffmpeg and worker process trees) and fsync recordings.
+	// Open sessions stay 'recording' and become resumable on the next start.
+	if liveManager != nil {
+		liveManager.Shutdown(ctx)
+	}
+
+	if shutdownErr != nil {
+		logger.Error("Server forced to shutdown", "error", shutdownErr)
 		os.Exit(1)
 	}
 
