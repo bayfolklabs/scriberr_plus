@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -148,6 +149,11 @@ func TestPipelineWithFakeWorker(t *testing.T) {
 	rec, _ := os.ReadFile(filepath.Join(filepath.Dir(done.AudioPath), recordingFileName))
 	if !bytes.Equal(rec, audio) {
 		t.Fatal("recording.webm differs from the uploaded chunks")
+	}
+
+	// The client's last seq was saved at stop, for a finalize resumed after a restart.
+	if meta := readMeta(filepath.Dir(done.AudioPath), &done); meta.LastSeq == nil || *meta.LastSeq != next-1 {
+		t.Fatalf("session.json last_seq = %v, want %d", meta.LastSeq, next-1)
 	}
 
 	// Stopping again is idempotent; state is served from disk now.
@@ -297,7 +303,7 @@ func TestFinalizeResumesAfterRestart(t *testing.T) {
 	}
 
 	exe := testExe(t)
-	m2 := NewManager(db, Options{UploadDir: uploads, EnvDir: filepath.Join(uploads, "env"), WorkerCmd: exe + " fake-live-worker"})
+	m2 := NewManager(db, Options{UploadDir: uploads, EnvDir: filepath.Join(uploads, "env"), WorkerCmd: quoteArg(exe) + " fake-live-worker"})
 	m2.decoderCmd = []string{exe, "fake-decoder"}
 	t.Cleanup(func() { shutdownManager(t, m2) })
 	if err := m2.Recover(ctx); err != nil {
@@ -319,25 +325,36 @@ func TestJanitorSuspendsAndFinalizesAbandoned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next := feed(t, m, job.ID, 0, split(pcm(2.5), sampleRate))
+	next := feed(t, m, job.ID, 0, split(pcm(1.5), sampleRate))
+	waitFor(t, 20*time.Second, "segment", func() bool {
+		st, _ := m.State(ctx, job.ID, -1)
+		return st.ReceivedAudioSec == 1.5
+	})
+
+	// A session that went idle is suspended: its pipeline stops, and it stays
+	// resumable.
+	m.opts.AbandonAfter = 50 * time.Millisecond
+	time.Sleep(100 * time.Millisecond)
+	m.suspend(m.get(job.ID), true)
+	if m.get(job.ID) != nil {
+		t.Fatal("idle session still open after suspend")
+	}
+	if got := loadJob(t, db, job.ID).LiveStatus; got != models.LiveStatusInterrupted {
+		t.Fatalf("live_status = %s, want interrupted", got)
+	}
+	m.opts.AbandonAfter = time.Hour
+	next = feed(t, m, job.ID, next, split(pcm(1), sampleRate)) // the client resumes
 	waitFor(t, 20*time.Second, "segment", func() bool {
 		st, _ := m.State(ctx, job.ID, -1)
 		return len(st.Segments) >= 1
 	})
 
-	// The browser vanished: no chunks for longer than AbandonAfter.
+	// The browser vanished: no chunks for longer than AbandonAfter. One sweep
+	// suspends the session and, since it is measured from the last chunk (not from
+	// the suspend), also finalizes it.
 	m.opts.AbandonAfter = 50 * time.Millisecond
 	time.Sleep(100 * time.Millisecond)
-	m.sweep() // recording -> interrupted (pipeline stopped, still resumable)
-	if m.get(job.ID) != nil {
-		t.Fatal("idle session still open after sweep")
-	}
-	if got := loadJob(t, db, job.ID).LiveStatus; got != models.LiveStatusInterrupted {
-		t.Fatalf("live_status = %s, want interrupted", got)
-	}
-
-	time.Sleep(100 * time.Millisecond)
-	m.sweep() // interrupted and idle -> finalized
+	m.sweep()
 	done := waitFinalized(t, db, job.ID)
 	res := decodeTranscript(t, done.Transcript)
 	// Finalize drained the rest of the recording (2-2.5 s) through the worker.
@@ -418,6 +435,259 @@ func TestEmptySessionFinalizes(t *testing.T) {
 	done := waitFinalized(t, db, job.ID)
 	if res := decodeTranscript(t, done.Transcript); res.Text != "" || len(res.Segments) != 0 {
 		t.Fatalf("empty session transcript = %+v", res)
+	}
+}
+
+// TestBackgroundFinalizesOneAtATime checks that the janitor finalizes abandoned
+// sessions one per sweep, never while a meeting is live, and never an open session.
+func TestBackgroundFinalizesOneAtATime(t *testing.T) {
+	db := newTestDB(t)
+	m := newTestManager(t, db, t.TempDir(), true)
+	ctx := context.Background()
+
+	var abandoned []string
+	for i := 0; i < 2; i++ {
+		job, err := m.CreateSession(ctx, CreateRequest{Title: fmt.Sprintf("abandoned %d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		feed(t, m, job.ID, 0, split(pcm(1), sampleRate))
+		abandoned = append(abandoned, job.ID)
+	}
+	m.opts.AbandonAfter = 50 * time.Millisecond
+	time.Sleep(100 * time.Millisecond)
+	for _, id := range abandoned {
+		m.suspend(m.get(id), true)
+	}
+	m.opts.AbandonAfter = time.Second
+	time.Sleep(1200 * time.Millisecond) // both are now abandoned
+
+	live, err := m.CreateSession(ctx, CreateRequest{Title: "live"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := feed(t, m, live.ID, 0, split(pcm(1), sampleRate))
+	if _, err := m.close(ctx, live.ID, nil, true); !errors.Is(err, errBusy) {
+		t.Fatalf("background close of an open session: %v, want errBusy", err)
+	}
+	m.sweep() // a meeting is live: nothing is finalized
+	for _, id := range abandoned {
+		if got := loadJob(t, db, id).LiveStatus; got != models.LiveStatusInterrupted {
+			t.Fatalf("abandoned session %s is %s while a meeting is live", id, got)
+		}
+	}
+	if got := loadJob(t, db, live.ID).LiveStatus; got != models.LiveStatusRecording {
+		t.Fatalf("live session is %s after sweep", got)
+	}
+
+	if _, err := m.Stop(ctx, live.ID, next-1); err != nil {
+		t.Fatal(err)
+	}
+	waitFinalized(t, db, live.ID)
+
+	m.sweep() // exactly one abandoned session starts finalizing
+	var first, second string
+	for _, id := range abandoned {
+		if loadJob(t, db, id).LiveStatus == models.LiveStatusInterrupted {
+			second = id
+		} else {
+			first = id
+		}
+	}
+	if first == "" || second == "" {
+		t.Fatalf("one sweep should start exactly one finalize: %s", first+second)
+	}
+	waitFinalized(t, db, first)
+	if got := loadJob(t, db, second).LiveStatus; got != models.LiveStatusInterrupted {
+		t.Fatalf("second session is %s before the next sweep", got)
+	}
+	m.sweep()
+	waitFinalized(t, db, second)
+}
+
+// TestFinalizeKeepsBatchTranscript checks that finalize completes the job with the
+// live transcript only when no batch pass owns it.
+func TestFinalizeKeepsBatchTranscript(t *testing.T) {
+	db := newTestDB(t)
+	m := newTestManager(t, db, t.TempDir(), true)
+	ctx := context.Background()
+
+	cases := []struct {
+		status   models.JobStatus
+		keepsOwn bool
+	}{
+		{models.StatusCompleted, true}, // a batch pass completed during the meeting
+		{models.StatusProcessing, true},
+		{models.StatusFailed, false}, // a failed batch pass: the live transcript fills in
+	}
+	for _, tc := range cases {
+		job, err := m.CreateSession(ctx, CreateRequest{Title: string(tc.status)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := feed(t, m, job.ID, 0, split(pcm(2.5), sampleRate))
+		batch := `{"text":"batch"}`
+		if err := db.Model(&models.TranscriptionJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+			"status": tc.status, "transcript_source": models.TranscriptSourceBatch, "transcript": batch,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Stop(ctx, job.ID, next-1); err != nil {
+			t.Fatal(err)
+		}
+		done := waitFinalized(t, db, job.ID)
+		if live := decodeTranscript(t, done.LiveTranscript); len(live.Segments) != 2 {
+			t.Fatalf("%s: live transcript segments = %d", tc.status, len(live.Segments))
+		}
+		kept := done.Status == tc.status && done.TranscriptSource == models.TranscriptSourceBatch &&
+			done.Transcript != nil && *done.Transcript == batch
+		completed := done.Status == models.StatusCompleted && done.TranscriptSource == models.TranscriptSourceLive &&
+			done.Transcript != nil && *done.Transcript == *done.LiveTranscript
+		if (tc.keepsOwn && !kept) || (!tc.keepsOwn && !completed) {
+			t.Fatalf("%s: after finalize status=%s transcript_source=%s", tc.status, done.Status, done.TranscriptSource)
+		}
+	}
+}
+
+// TestDrainDeadline checks that a worker slower than its backlog does not keep the
+// session finalizing indefinitely: finalize goes on with the segments so far.
+func TestDrainDeadline(t *testing.T) {
+	t.Setenv(readDelayEnv, "80ms") // at most about 3.2 s of audio per second
+	db := newTestDB(t)
+	m := newTestManager(t, db, t.TempDir(), true)
+	m.drainTimeout = 5 * time.Second // progress keeps coming: never idle
+	m.maxDrain = 2 * time.Second
+	ctx := context.Background()
+
+	job, err := m.CreateSession(ctx, CreateRequest{Title: "backlog"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := feed(t, m, job.ID, 0, split(pcm(40), sampleRate))
+	if _, err := m.Stop(ctx, job.ID, next-1); err != nil {
+		t.Fatal(err)
+	}
+	done := waitFinalized(t, db, job.ID)
+	// A full drain would take over 12 s and produce 20 segments.
+	if res := decodeTranscript(t, done.Transcript); len(res.Segments) == 0 || len(res.Segments) >= 20 {
+		t.Fatalf("segments = %d, want a partial transcript", len(res.Segments))
+	}
+}
+
+// TestDrainWaitsForModelLoad stops a session while the worker is still loading its
+// model (no progress at all): finalize waits for it instead of killing it after
+// drainTimeout.
+func TestDrainWaitsForModelLoad(t *testing.T) {
+	t.Setenv(readyDelayEnv, "3s")
+	db := newTestDB(t)
+	m := newTestManager(t, db, t.TempDir(), true)
+	m.drainTimeout = time.Second
+	ctx := context.Background()
+
+	job, err := m.CreateSession(ctx, CreateRequest{Title: "loading"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := feed(t, m, job.ID, 0, split(pcm(3), sampleRate))
+	if _, err := m.Stop(ctx, job.ID, next-1); err != nil {
+		t.Fatal(err)
+	}
+	done := waitFinalized(t, db, job.ID)
+	if res := decodeTranscript(t, done.Transcript); len(res.Segments) != 2 || res.Segments[1].End != 3 {
+		t.Fatalf("segments = %+v", res.Segments)
+	}
+}
+
+// TestStopRefusedAfterSyncFailure checks that after a failed fsync no chunk is
+// acknowledged (not even a duplicate) and Stop fails, so the client keeps its copy.
+func TestStopRefusedAfterSyncFailure(t *testing.T) {
+	db := newTestDB(t)
+	m := newTestManager(t, db, t.TempDir(), true)
+	ctx := context.Background()
+
+	job, err := m.CreateSession(ctx, CreateRequest{Title: "disk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := split(pcm(1), sampleRate)
+	next := feed(t, m, job.ID, 0, chunks)
+	s := m.get(job.ID)
+	s.mu.Lock()
+	s.store.syncErr = errors.New("simulated fsync failure")
+	s.mu.Unlock()
+
+	if ack, err := m.AppendChunk(ctx, job.ID, 0, chunks[0]); err == nil {
+		t.Fatalf("duplicate acknowledged after an fsync failure: %+v", ack)
+	}
+	var liveErr *Error
+	if _, err := m.Stop(ctx, job.ID, next-1); err == nil || errors.As(err, &liveErr) {
+		t.Fatalf("stop after an fsync failure: %v, want an internal error", err)
+	}
+	if got := loadJob(t, db, job.ID).LiveStatus; got != models.LiveStatusRecording {
+		t.Fatalf("live_status = %s, want recording", got)
+	}
+}
+
+// TestResumedFinalizeWithLostChunks: the server acknowledged every chunk and the
+// stop, then lost the last chunk at a power loss. The finalize resumed after the
+// restart makes the session resumable instead of finalizing without that chunk.
+func TestResumedFinalizeWithLostChunks(t *testing.T) {
+	db := newTestDB(t)
+	uploads := t.TempDir()
+	ctx := context.Background()
+
+	m1 := newTestManager(t, db, uploads, true)
+	job, err := m1.CreateSession(ctx, CreateRequest{Title: "power loss"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := split(pcm(3), sampleRate)
+	next := feed(t, m1, job.ID, 0, chunks)
+	waitFor(t, 20*time.Second, "first segment", func() bool {
+		st, _ := m1.State(ctx, job.ID, -1)
+		return len(st.Segments) >= 1
+	})
+	shutdownManager(t, m1)
+
+	// Stop had been accepted (last_seq saved, finalizing), then the last chunk's data was lost.
+	dir := filepath.Join(uploads, "live", job.ID)
+	meta := readMeta(dir, job)
+	lastSeq := next - 1
+	meta.LastSeq = &lastSeq
+	if err := writeMeta(dir, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.TranscriptionJob{}).Where("id = ?", job.ID).Update("live_status", models.LiveStatusFinalizing).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(dir, recordingFileName), int64(len(pcm(3))-100)); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := testExe(t)
+	m2 := NewManager(db, Options{UploadDir: uploads, EnvDir: filepath.Join(uploads, "env"), WorkerCmd: quoteArg(exe) + " fake-live-worker"})
+	m2.decoderCmd = []string{exe, "fake-decoder"}
+	m2.janitorInterval = time.Hour
+	t.Cleanup(func() { shutdownManager(t, m2) })
+	if err := m2.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m2.Start()
+	if got := loadJob(t, db, job.ID).LiveStatus; got != models.LiveStatusInterrupted || m2.get(job.ID) != nil {
+		t.Fatalf("live_status after resumed finalize = %s, want interrupted", got)
+	}
+
+	// The client resumes: it resends the lost chunk and stops again.
+	ack, err := m2.AppendChunk(ctx, job.ID, lastSeq, chunks[lastSeq])
+	if err != nil || ack.Duplicate || ack.NextSeq != next {
+		t.Fatalf("resend lost chunk: %+v %v", ack, err)
+	}
+	if _, err := m2.Stop(ctx, job.ID, lastSeq); err != nil {
+		t.Fatal(err)
+	}
+	done := waitFinalized(t, db, job.ID)
+	if res := decodeTranscript(t, done.Transcript); len(res.Segments) != 2 || res.Segments[1].End != 3 {
+		t.Fatalf("segments = %+v", res.Segments)
 	}
 }
 

@@ -227,10 +227,13 @@ func main() {
 	// Gracefully shutdown the server
 	shutdownErr := srv.Shutdown(ctx)
 
-	// Stop live pipelines (ffmpeg and worker process trees) and fsync recordings.
-	// Open sessions stay 'recording' and become resumable on the next start.
+	// Stop live pipelines (ffmpeg and worker process trees, and any uv setup
+	// command) and fsync recordings. Open sessions stay 'recording' and become
+	// resumable on the next start. Its own deadline: srv.Shutdown may have used up ctx.
 	if liveManager != nil {
-		liveManager.Shutdown(ctx)
+		liveCtx, liveCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		liveManager.Shutdown(liveCtx)
+		liveCancel()
 	}
 
 	if shutdownErr != nil {

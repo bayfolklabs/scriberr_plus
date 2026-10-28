@@ -17,7 +17,6 @@ import { useToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { useLiveSession } from "./liveSessionContext";
 import type { LiveSnapshot } from "./liveController";
-import { downloadLocalRecording } from "./chunkStore";
 import { errorMessage } from "./format";
 import { LiveBanner } from "./LiveBanner";
 import { LiveStatusBar } from "./LiveStatusBar";
@@ -71,18 +70,30 @@ export function LiveSessionView() {
 	const serverDown = !snapshot.serverReachable || (upload?.retrying ?? false);
 	const pending = Math.max(0, snapshot.recordedChunks - snapshot.uploadedChunks);
 	const uploadPercent = snapshot.recordedChunks > 0 ? (snapshot.uploadedChunks / snapshot.recordedChunks) * 100 : 100;
+	// Audio IndexedDB refused lives only in this tab: leaving the meeting would lose it.
+	const memoryOnly = snapshot.memoryOnlyChunks > 0;
+	const memoryOnlyNote = memoryOnly
+		? " Part of the audio is only in this tab's memory because the browser could not store it; download the recording before you leave this meeting."
+		: "";
 
 	const handleDownload = async () => {
 		if (!snapshot.localId) return;
 		setDownloading(true);
 		try {
-			await downloadLocalRecording({ id: snapshot.localId, title: snapshot.title, mimeType: snapshot.mimeType });
+			await controller.downloadRecording();
 		} catch (error) {
 			toast({ title: "Download failed", description: errorMessage(error) });
 		} finally {
 			setDownloading(false);
 		}
 	};
+
+	const downloadButton = (label: string) => (
+		<Button size="sm" variant="outline" onClick={() => void handleDownload()} disabled={downloading}>
+			{downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+			{label}
+		</Button>
+	);
 
 	const openTranscript = () => {
 		if (snapshot.serverId) navigate(`/audio/${snapshot.serverId}`);
@@ -208,17 +219,26 @@ export function LiveSessionView() {
 										<RefreshCw className="h-4 w-4" />
 										Retry now
 									</Button>
-									<Button size="sm" variant="ghost" onClick={controller.keepLocally}>
-										Keep in this browser for later
-									</Button>
+									{memoryOnly ? (
+										downloadButton("Download recording first")
+									) : (
+										<Button size="sm" variant="ghost" onClick={controller.keepLocally}>
+											Keep in this browser for later
+										</Button>
+									)}
 								</>
 							}
 						>
-							The meeting is safe in this browser. Keep this page open to finish automatically, or keep it for later
-							and use "Resume upload".
+							{memoryOnly
+								? "Part of the audio is only in this tab's memory because the browser could not store it. Keep this page open to finish automatically, or download the recording before you leave."
+								: 'The meeting is safe in this browser. Keep this page open to finish automatically, or keep it for later and use "Resume upload".'}
 						</LiveBanner>
 					) : (
-						<p className="text-xs text-[var(--text-tertiary)]">Keep this page open until the upload finishes.</p>
+						<>
+							{/* e.g. a chunk could not be read from this browser's storage; it is retried */}
+							{upload?.lastError && <p className="text-xs text-[var(--warning-solid)]">{upload.lastError}</p>}
+							<p className="text-xs text-[var(--text-tertiary)]">Keep this page open until the upload finishes.</p>
+						</>
 					)}
 				</div>
 			)}
@@ -232,11 +252,14 @@ export function LiveSessionView() {
 							Finishing the live transcript and building the final recording. This can take a minute or two. Your
 							audio is already safe on the server.
 						</p>
-						{serverDown && (
-							<Button size="sm" variant="ghost" onClick={controller.keepLocally} className="mt-1 -ml-3">
-								Stop waiting (check back later)
-							</Button>
-						)}
+						{serverDown &&
+							(memoryOnly ? (
+								<div className="mt-1">{downloadButton("Download recording first")}</div>
+							) : (
+								<Button size="sm" variant="ghost" onClick={controller.keepLocally} className="mt-1 -ml-3">
+									Stop waiting (check back later)
+								</Button>
+							))}
 					</div>
 				</div>
 			)}
@@ -253,12 +276,7 @@ export function LiveSessionView() {
 									Open transcript
 								</Button>
 							)}
-							{snapshot.incompleteOnServer && (
-								<Button size="sm" variant="outline" onClick={() => void handleDownload()} disabled={downloading}>
-									{downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-									Download full recording
-								</Button>
-							)}
+							{snapshot.incompleteOnServer && downloadButton("Download full recording")}
 							<Button size="sm" variant="outline" onClick={controller.reset}>
 								<Plus className="h-4 w-4" />
 								New meeting
@@ -271,6 +289,7 @@ export function LiveSessionView() {
 						: snapshot.autoRetranscribe
 							? "The live transcript is in your library. A full re-transcription of the recording has been queued."
 							: "The live transcript and the full recording are in your library. You can re-transcribe it there with a better model."}
+					{memoryOnlyNote}
 				</LiveBanner>
 			)}
 
@@ -284,10 +303,7 @@ export function LiveSessionView() {
 								<RotateCcw className="h-4 w-4" />
 								Try again
 							</Button>
-							<Button size="sm" variant="outline" onClick={() => void handleDownload()} disabled={downloading}>
-								{downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-								Download recording
-							</Button>
+							{downloadButton("Download recording")}
 							{snapshot.serverId && (
 								<Button size="sm" variant="outline" onClick={openTranscript}>
 									<FileText className="h-4 w-4" />
@@ -301,6 +317,7 @@ export function LiveSessionView() {
 					}
 				>
 					{snapshot.error}
+					{memoryOnlyNote}
 				</LiveBanner>
 			)}
 

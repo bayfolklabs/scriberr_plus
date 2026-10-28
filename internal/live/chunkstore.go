@@ -18,7 +18,8 @@ const (
 	metaFileName      = "session.json"         // session settings that must survive restarts
 )
 
-// syncEvery is how many appended chunks may stay un-fsynced
+// syncEvery is how many chunks.idx lines may stay un-fsynced (the recording itself
+// is synced before each chunk is indexed)
 const syncEvery = 5
 
 var (
@@ -44,6 +45,7 @@ type chunkStore struct {
 	size     int64 // end offset of the last indexed chunk
 	idxSize  int64
 	unsynced int
+	syncErr  error // first failed fsync: nothing is acknowledged until the store is reopened
 }
 
 // readIndex parses chunks.idx and returns its valid prefix: sequential seqs that
@@ -83,12 +85,37 @@ func readIndex(path string) ([]indexEntry, error) {
 	return entries, nil
 }
 
+// presentEntries drops trailing index entries whose data is not fully present in a
+// recording of recSize bytes: the index may claim bytes the recording lost
+// (unsynced data at power loss).
+func presentEntries(entries []indexEntry, recSize int64) []indexEntry {
+	for len(entries) > 0 {
+		last := entries[len(entries)-1]
+		if last.offset+last.length <= recSize {
+			break
+		}
+		entries = entries[:len(entries)-1]
+	}
+	return entries
+}
+
 // indexSummary returns next_seq and the recording end offset from chunks.idx
-// without opening the session for writing.
+// without opening the session for writing. It agrees with what openChunkStore
+// would keep.
 func indexSummary(dir string) (nextSeq int, size int64, err error) {
 	entries, err := readIndex(filepath.Join(dir, indexFileName))
 	if err != nil || len(entries) == 0 {
 		return 0, 0, err
+	}
+	var recSize int64
+	if info, err := os.Stat(filepath.Join(dir, recordingFileName)); err == nil {
+		recSize = info.Size()
+	} else if !os.IsNotExist(err) {
+		return 0, 0, err
+	}
+	entries = presentEntries(entries, recSize)
+	if len(entries) == 0 {
+		return 0, 0, nil
 	}
 	last := entries[len(entries)-1]
 	return len(entries), last.offset + last.length, nil
@@ -118,15 +145,7 @@ func openChunkStore(dir string) (*chunkStore, error) {
 		return nil, err
 	}
 
-	// The index may claim bytes the recording lost (unsynced data at power loss):
-	// keep only entries that are fully present.
-	for len(entries) > 0 {
-		last := entries[len(entries)-1]
-		if last.offset+last.length <= recInfo.Size() {
-			break
-		}
-		entries = entries[:len(entries)-1]
-	}
+	entries = presentEntries(entries, recInfo.Size())
 
 	s := &chunkStore{dir: dir, rec: rec}
 	if len(entries) > 0 {
@@ -169,10 +188,15 @@ func openChunkStore(dir string) (*chunkStore, error) {
 }
 
 // append writes chunk seq at the end of the recording and indexes it. It returns
-// errDuplicateChunk for seq < nextSeq and errChunkGap for seq > nextSeq.
+// errDuplicateChunk for seq < nextSeq and errChunkGap for seq > nextSeq. After a
+// failed fsync it returns that error for every seq, duplicates included, so no
+// chunk is acknowledged while its durability is unknown.
 func (s *chunkStore) append(seq int, data []byte) error {
 	if s.rec == nil {
 		return os.ErrClosed
+	}
+	if s.syncErr != nil {
+		return s.syncErr
 	}
 	if seq < s.nextSeq {
 		return errDuplicateChunk
@@ -184,6 +208,14 @@ func (s *chunkStore) append(seq int, data []byte) error {
 	if _, err := s.rec.Write(data); err != nil {
 		s.rollback()
 		return fmt.Errorf("failed to append chunk: %w", err)
+	}
+	// The data is durable before its index line exists, so after a power loss an
+	// index entry never covers zero-filled or torn audio. The index itself is
+	// synced every syncEvery chunks; a lost line only means the client resends.
+	if err := s.rec.Sync(); err != nil {
+		s.syncErr = fmt.Errorf("failed to sync recording: %w", err)
+		s.rollback()
+		return s.syncErr
 	}
 	line := fmt.Sprintf("%d %d %d\n", seq, s.size, len(data))
 	if _, err := s.idx.Write([]byte(line)); err != nil {
@@ -209,25 +241,29 @@ func (s *chunkStore) rollback() {
 	_, _ = s.idx.Seek(s.idxSize, 0)
 }
 
-// sync flushes both files to disk
+// sync flushes both files to disk. A failure is sticky: a later fsync can succeed
+// without the lost writes ever reaching the disk.
 func (s *chunkStore) sync() error {
-	if s.rec == nil {
-		return nil
+	if s.rec == nil || s.syncErr != nil {
+		return s.syncErr
 	}
 	if err := s.rec.Sync(); err != nil {
-		return fmt.Errorf("failed to sync recording: %w", err)
+		s.syncErr = fmt.Errorf("failed to sync recording: %w", err)
+		return s.syncErr
 	}
 	if err := s.idx.Sync(); err != nil {
-		return fmt.Errorf("failed to sync chunk index: %w", err)
+		s.syncErr = fmt.Errorf("failed to sync chunk index: %w", err)
+		return s.syncErr
 	}
 	s.unsynced = 0
 	return nil
 }
 
-// close syncs and closes the files. It is safe to call more than once.
+// close syncs and closes the files. It is safe to call more than once; every call
+// reports a failed fsync.
 func (s *chunkStore) close() error {
 	if s.rec == nil {
-		return nil
+		return s.syncErr
 	}
 	err := s.sync()
 	if cerr := s.rec.Close(); err == nil {
@@ -242,4 +278,33 @@ func (s *chunkStore) close() error {
 
 func (s *chunkStore) recordingPath() string {
 	return filepath.Join(s.dir, recordingFileName)
+}
+
+// syncFile flushes a file's data to disk (Windows needs write access for that)
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// writeFileSync writes data to path and flushes it to disk
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

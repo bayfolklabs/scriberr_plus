@@ -55,7 +55,7 @@ func TestProcessTreeKilled(t *testing.T) {
 			UploadDir: uploads,
 			EnvDir:    filepath.Join(uploads, "env"),
 			ModelsDir: filepath.Join(uploads, "models"),
-			WorkerCmd: "cmd /c " + exe + " fake-live-worker-hang " + pidFile,
+			WorkerCmd: "cmd /c " + quoteArg(exe) + " fake-live-worker-hang " + quoteArg(pidFile),
 		})
 		m.decoderCmd = []string{exe, "fake-decoder"}
 		m.drainTimeout = 2 * time.Second

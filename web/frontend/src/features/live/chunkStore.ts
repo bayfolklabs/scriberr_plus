@@ -162,12 +162,17 @@ export async function getChunk(sessionId: string, seq: number): Promise<Blob | n
 	return chunk?.blob ?? null;
 }
 
-/** All chunk blobs of a session in seq order. */
-export async function readChunks(sessionId: string): Promise<Blob[]> {
+/** All chunks of a session with their seq, in seq order. */
+export async function readChunkEntries(sessionId: string): Promise<Array<{ seq: number; blob: Blob }>> {
 	const db = await openDb();
 	const tx = db.transaction(CHUNKS, "readonly");
 	const chunks = await requestResult(tx.objectStore(CHUNKS).getAll(chunkRange(sessionId)) as IDBRequest<LocalChunk[]>);
-	return chunks.sort((a, b) => a.seq - b.seq).map((chunk) => chunk.blob);
+	return chunks.sort((a, b) => a.seq - b.seq).map(({ seq, blob }) => ({ seq, blob }));
+}
+
+/** All chunk blobs of a session in seq order. */
+export async function readChunks(sessionId: string): Promise<Blob[]> {
+	return (await readChunkEntries(sessionId)).map((chunk) => chunk.blob);
 }
 
 export async function deleteChunks(sessionId: string): Promise<void> {
@@ -207,20 +212,24 @@ function safeFileName(title: string): string {
 }
 
 /**
- * Concatenates the stored chunks into one file and hands it to the browser as a download.
+ * Joins chunks (already in seq order) into one file and hands it to the browser as a download.
  * MediaRecorder chunks joined in order form a valid (if unseekable) WebM file.
  */
-export async function downloadLocalRecording(session: Pick<LocalSession, "id" | "title" | "mimeType">): Promise<void> {
-	const blobs = await readChunks(session.id);
+export function saveRecordingFile(blobs: Blob[], title: string, mimeType: string): void {
 	if (blobs.length === 0) throw new Error("No audio is saved in this browser for this meeting");
-	const type = session.mimeType.split(";")[0] || "audio/webm";
+	const type = mimeType.split(";")[0] || "audio/webm";
 	const recording = new Blob(blobs, { type });
 	const url = URL.createObjectURL(recording);
 	const link = document.createElement("a");
 	link.href = url;
-	link.download = `${safeFileName(session.title)}.${extensionFor(type)}`;
+	link.download = `${safeFileName(title)}.${extensionFor(type)}`;
 	document.body.appendChild(link);
 	link.click();
 	link.remove();
 	window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/** Downloads the chunks stored for a session as one recording file. */
+export async function downloadLocalRecording(session: Pick<LocalSession, "id" | "title" | "mimeType">): Promise<void> {
+	saveRecordingFile(await readChunks(session.id), session.title, session.mimeType);
 }

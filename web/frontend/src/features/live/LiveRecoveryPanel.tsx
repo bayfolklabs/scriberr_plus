@@ -14,7 +14,7 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { useLiveSession } from "./liveSessionContext";
-import { heldSessionLocks, isActivePhase } from "./liveController";
+import { heldSessionLocks, isActivePhase, withSessionLock } from "./liveController";
 import {
 	deleteSession,
 	downloadLocalRecording,
@@ -113,6 +113,19 @@ export function LiveRecoveryPanel() {
 		void refresh();
 	}, [refresh, snapshot.phase]);
 
+	// Another tab may have picked up or finished a meeting meanwhile ("Open in another tab").
+	useEffect(() => {
+		const handleReturn = () => {
+			if (document.visibilityState === "visible") void refresh();
+		};
+		document.addEventListener("visibilitychange", handleReturn);
+		window.addEventListener("focus", handleReturn);
+		return () => {
+			document.removeEventListener("visibilitychange", handleReturn);
+			window.removeEventListener("focus", handleReturn);
+		};
+	}, [refresh]);
+
 	// The meeting shown above (active, finished or failed) is handled there, not here.
 	const visibleLocal = localRows.filter((row) => row.session.id !== activeLocalId);
 	const visibleServer = serverSessions.filter((session) => session.id !== activeServerId);
@@ -142,8 +155,13 @@ export function LiveRecoveryPanel() {
 		if (!target) return;
 		setBusyId(target.id);
 		try {
-			await deleteSession(target.id);
-			toast({ title: "Recording discarded", description: `"${target.title}" was removed from this browser.` });
+			// Under the meeting's lock: the list may be stale, and another tab may be uploading it now.
+			const discarded = await withSessionLock(target.id, () => deleteSession(target.id));
+			if (discarded) {
+				toast({ title: "Recording discarded", description: `"${target.title}" was removed from this browser.` });
+			} else {
+				toast({ title: "Meeting is open in another tab", description: "Finish or close it there first." });
+			}
 		} catch (error) {
 			toast({ title: "Could not discard", description: errorMessage(error) });
 		} finally {
@@ -272,6 +290,12 @@ export function LiveRecoveryPanel() {
 					{visibleServer.map((session) => {
 						const local = localByServerId.get(session.id);
 						const busy = busyId === session.id;
+						const badge: { tone: "warn" | "neutral" | "bad"; label: string } =
+							session.live_status === "interrupted"
+								? { tone: "warn", label: "Interrupted" }
+								: session.live_status === "failed"
+									? { tone: "bad", label: "Finalize failed" }
+									: { tone: "neutral", label: "Recording" };
 						return (
 							<div
 								key={session.id}
@@ -279,9 +303,7 @@ export function LiveRecoveryPanel() {
 							>
 								<div className="flex flex-wrap items-center gap-2">
 									<span className="font-medium text-[var(--text-primary)] truncate">{session.title || "Untitled meeting"}</span>
-									<StateBadge tone={session.live_status === "interrupted" ? "warn" : "neutral"}>
-										{session.live_status === "interrupted" ? "Interrupted" : "Recording"}
-									</StateBadge>
+									<StateBadge tone={badge.tone}>{badge.label}</StateBadge>
 								</div>
 								<div className="text-xs text-[var(--text-tertiary)] space-y-1">
 									<div>
@@ -295,7 +317,9 @@ export function LiveRecoveryPanel() {
 									</div>
 									{local && (
 										<div className="text-[var(--text-secondary)]">
-											Also saved in this browser. "Resume upload" above sends the rest and finalizes it.
+											{session.live_status === "failed"
+												? 'Also saved in this browser. "Resume upload" above retries the finalize and keeps the browser copy if the server is missing audio.'
+												: 'Also saved in this browser. "Resume upload" above sends the rest and finalizes it.'}
 										</div>
 									)}
 								</div>
@@ -341,7 +365,9 @@ export function LiveRecoveryPanel() {
 								? "This browser holds audio the server has not received yet. Finalizing now leaves it out; use \"Resume upload\" instead to keep everything."
 								: finalizeTarget?.live_status === "recording"
 									? "The server still treats this meeting as recording, so it may be live in another tab or device. Finalizing ends it with the audio received so far."
-									: "The meeting is closed with the audio the server received, and its live transcript is saved to your library."}
+									: finalizeTarget?.live_status === "failed"
+										? "The last attempt to finalize this meeting failed. This tries again with the audio the server received, and saves its live transcript to your library."
+										: "The meeting is closed with the audio the server received, and its live transcript is saved to your library."}
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>

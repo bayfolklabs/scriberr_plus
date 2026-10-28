@@ -125,6 +125,85 @@ func TestChunkStoreReopenDropsEntriesMissingData(t *testing.T) {
 	}
 }
 
+// TestIndexSummaryMatchesReopen checks that a closed session reports what a reopen
+// would keep, before any reopen trimmed the index.
+func TestIndexSummaryMatchesReopen(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := openChunkStore(dir)
+	for i := 0; i < 5; i++ {
+		_ = s.append(i, []byte("0123456789"))
+	}
+	s.close()
+
+	if err := os.Truncate(filepath.Join(dir, recordingFileName), 25); err != nil {
+		t.Fatal(err)
+	}
+	if next, size, err := indexSummary(dir); err != nil || next != 2 || size != 20 {
+		t.Fatalf("indexSummary = %d, %d, %v; want 2 and 20", next, size, err)
+	}
+	if err := os.Remove(filepath.Join(dir, recordingFileName)); err != nil {
+		t.Fatal(err)
+	}
+	if next, size, err := indexSummary(dir); err != nil || next != 0 || size != 0 {
+		t.Fatalf("indexSummary without recording = %d, %d, %v", next, size, err)
+	}
+}
+
+// TestChunkStoreSyncFailureIsSticky checks that after a failed fsync nothing is
+// acknowledged again, duplicates included, and close reports the failure.
+func TestChunkStoreSyncFailureIsSticky(t *testing.T) {
+	s, err := openChunkStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.append(i, []byte("abcd")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.idx.Close() // the next index fsync fails
+	syncErr := s.sync()
+	if syncErr == nil {
+		t.Fatal("sync of a closed index succeeded")
+	}
+	for _, seq := range []int{1, 3, 7} { // duplicate, next, gap
+		if err := s.append(seq, []byte("abcd")); err != syncErr {
+			t.Fatalf("append %d after a failed fsync: %v, want %v", seq, err, syncErr)
+		}
+	}
+	if err := s.sync(); err != syncErr {
+		t.Fatalf("sync retried: %v", err)
+	}
+	if err := s.close(); err == nil {
+		t.Fatal("close reported success after a failed fsync")
+	}
+	if err := s.close(); err == nil {
+		t.Fatal("second close reported success after a failed fsync")
+	}
+}
+
+func TestSplitCommandLine(t *testing.T) {
+	cases := map[string][]string{
+		`worker --threads 4`: {"worker", "--threads", "4"},
+		"  a \t b  ":         {"a", "b"},
+		`"C:\Program Files\py\python.exe" "C:\w x\worker.py" -v`: {`C:\Program Files\py\python.exe`, `C:\w x\worker.py`, "-v"},
+		`cmd /c a"b c"d`: {"cmd", "/c", "ab cd"},
+		`x ""`:           {"x", ""},
+		"":               nil,
+	}
+	for in, want := range cases {
+		got := splitCommandLine(in)
+		if len(got) != len(want) {
+			t.Fatalf("splitCommandLine(%q) = %q, want %q", in, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("splitCommandLine(%q) = %q, want %q", in, got, want)
+			}
+		}
+	}
+}
+
 func appendFile(t *testing.T, path string, data []byte) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)

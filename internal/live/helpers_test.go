@@ -45,6 +45,8 @@ func TestMain(m *testing.M) {
 const (
 	fakeSegmentSamples = 2 * sampleRate // the fake worker emits one final per 2 s of audio
 	crashMarkerEnv     = "FAKE_LIVE_CRASH_MARKER"
+	readyDelayEnv      = "FAKE_LIVE_READY_DELAY" // e.g. "3s": "loading" first, then ready after the delay
+	readDelayEnv       = "FAKE_LIVE_READ_DELAY"  // e.g. "80ms": sleep after each stdin read (a slow worker)
 )
 
 // fakeWorker speaks the live worker protocol: PCM on stdin, JSON lines on stdout.
@@ -58,6 +60,12 @@ func fakeWorker() int {
 		out.WriteByte('\n')
 		out.Flush()
 	}
+
+	if d, err := time.ParseDuration(os.Getenv(readyDelayEnv)); err == nil && d > 0 {
+		emit(map[string]interface{}{"type": "loading", "stage": "download", "done": 0, "total": 100})
+		time.Sleep(d) // no heartbeats: only the longer drain bound keeps the worker alive
+	}
+	readDelay, _ := time.ParseDuration(os.Getenv(readDelayEnv))
 
 	emit(map[string]interface{}{"type": "ready", "engine": "fake", "sample_rate": sampleRate})
 
@@ -110,6 +118,9 @@ func fakeWorker() int {
 		if err != nil {
 			break
 		}
+		if readDelay > 0 {
+			time.Sleep(readDelay)
+		}
 	}
 	if total := totalBytes / bytesPerSample; total > segStart {
 		final(segStart, total)
@@ -146,10 +157,15 @@ func testExe(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("executable: %v", err)
 	}
-	if strings.ContainsAny(exe, " \t") {
-		t.Skip("test binary path contains spaces; LIVE_WORKER_CMD is split on whitespace")
-	}
 	return exe
+}
+
+// quoteArg quotes a LIVE_WORKER_CMD argument that contains spaces
+func quoteArg(s string) string {
+	if strings.ContainsAny(s, " \t") {
+		return `"` + s + `"`
+	}
+	return s
 }
 
 // newTestManager returns a started manager that uses the fake worker. With
@@ -163,7 +179,7 @@ func newTestManager(t *testing.T, db *gorm.DB, uploadDir string, fakeDecoder boo
 		ModelsDir:    filepath.Join(uploadDir, "models"),
 		Engine:       "fake",
 		AbandonAfter: time.Hour,
-		WorkerCmd:    exe + " fake-live-worker",
+		WorkerCmd:    quoteArg(exe) + " fake-live-worker",
 	})
 	if fakeDecoder {
 		m.decoderCmd = []string{exe, "fake-decoder"}

@@ -74,8 +74,8 @@ func (e *pythonEnv) isReady() bool {
 }
 
 // ensure starts preparation in the background unless it is ready, already
-// running, or failed recently.
-func (e *pythonEnv) ensure(ctx context.Context) {
+// running, or failed recently. The goroutine is tracked by wg.
+func (e *pythonEnv) ensure(ctx context.Context, wg *sync.WaitGroup) {
 	e.mu.Lock()
 	switch {
 	case e.state == envReady || e.state == envPreparing:
@@ -89,7 +89,9 @@ func (e *pythonEnv) ensure(ctx context.Context) {
 	e.lastAttempt = time.Now()
 	e.mu.Unlock()
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		start := time.Now()
 		err := e.prepare(ctx)
 
@@ -141,7 +143,7 @@ func (e *pythonEnv) prepare(ctx context.Context) error {
 	logger.Info("Installing live ASR dependencies", "env_path", e.dir)
 	cmd := exec.CommandContext(ctx, "uv", "sync", "--native-tls")
 	cmd.Dir = e.dir
-	prepareCmd(cmd)
+	prepareEnvCmd(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("uv sync failed: %w: %s", err, lastLines(out, 5))
 	}
@@ -156,7 +158,7 @@ func (e *pythonEnv) prepare(ctx context.Context) error {
 // adapters.CheckEnvironmentReady it is not cached, so it can be re-run after a sync.
 func (e *pythonEnv) importCheck(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, "uv", "run", "--native-tls", "--project", e.dir, "python", "-c", envImportCheck)
-	prepareCmd(cmd)
+	prepareEnvCmd(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, lastLines(out, 3))
 	}

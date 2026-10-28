@@ -1081,6 +1081,13 @@ func (h *Handler) getJobForTranscription(c *gin.Context, jobID string) (*models.
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot start transcription: job is currently processing or pending"})
 		return nil, fmt.Errorf("invalid job status")
 	}
+	// A live meeting's recording is incomplete until it is finalized, and a batch
+	// pass started meanwhile would become its final transcript.
+	if job.Source == models.SourceLive && (job.LiveStatus == models.LiveStatusRecording ||
+		job.LiveStatus == models.LiveStatusInterrupted || job.LiveStatus == models.LiveStatusFinalizing) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cannot start transcription: stop the live meeting first"})
+		return nil, fmt.Errorf("live session active")
+	}
 	return job, nil
 }
 

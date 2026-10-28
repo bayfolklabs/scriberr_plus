@@ -41,8 +41,11 @@ const (
 
 	// failedAfter consecutive failed runs report asr.state=failed (retries continue)
 	failedAfter = 5
-	// healthyRun resets the restart backoff
-	healthyRun = 30 * time.Second
+	// healthyRun resets the restart backoff, for a run that also processed at least
+	// healthyProgress of audio past its resume point (a restart first re-decodes the
+	// recording up to there, which says nothing about the worker)
+	healthyRun      = 30 * time.Second
+	healthyProgress = 15.0 // seconds
 	// maxDrainRestarts bounds restarts after the input has ended (finalize)
 	maxDrainRestarts = 3
 	// maxWorkerLine is the longest worker stdout line accepted
@@ -131,7 +134,7 @@ func (s *session) supervise() {
 				return
 			}
 		}
-		if res.healthy && time.Since(start) > healthyRun {
+		if res.healthy && time.Since(start) > healthyRun && s.processedSince(resumeAt) >= healthyProgress {
 			failures = 0
 		}
 		failures++
@@ -162,6 +165,30 @@ func (s *session) supervise() {
 			return
 		}
 	}
+}
+
+// processedSince returns how much audio the worker processed past resumeAt in the
+// current run
+func (s *session) processedSince(resumeAt float64) float64 {
+	s.asrMu.Lock()
+	defer s.asrMu.Unlock()
+	return s.asr.processedSec - resumeAt
+}
+
+// workerLoading reports whether the current run has a worker that has not
+// reported ready yet (starting, or downloading and loading its model)
+func (s *session) workerLoading() bool {
+	s.asrMu.Lock()
+	run := s.run
+	s.asrMu.Unlock()
+	return run != nil && !run.gotReady()
+}
+
+// setRun records the worker run in progress (nil when none)
+func (s *session) setRun(run *runEvents) {
+	s.asrMu.Lock()
+	s.run = run
+	s.asrMu.Unlock()
 }
 
 // beginRun resets per-run ASR stats and returns the resume offset
@@ -249,6 +276,8 @@ func (s *session) runOnce(withWorker bool, resumeAt float64) runResult {
 	wkTail := &lineTail{}
 	run := &runEvents{}
 	if withWorker {
+		s.setRun(run)
+		defer s.setRun(nil)
 		wk := s.m.workerCommand(ctx)
 		prepareCmd(wk)
 		wk.Env = append(os.Environ(), "PYTHONUNBUFFERED=1", "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8")
@@ -467,6 +496,12 @@ func (s *session) handleEvent(ev workerEvent, resumeAt float64, run *runEvents) 
 		s.touchLocked()
 		s.asrMu.Unlock()
 
+	case "loading":
+		// Heartbeat while the worker downloads or extracts its model
+		s.asrMu.Lock()
+		s.touchLocked()
+		s.asrMu.Unlock()
+
 	case "partial":
 		text := strings.TrimSpace(ev.Text)
 		s.asrMu.Lock()
@@ -578,7 +613,7 @@ func (m *Manager) decoderCommand(ctx context.Context) *exec.Cmd {
 // workerCommand builds the live worker command. LIVE_WORKER_CMD, when set, is a
 // full command line used instead, with the same stdin/stdout protocol.
 func (m *Manager) workerCommand(ctx context.Context) *exec.Cmd {
-	if fields := strings.Fields(m.opts.WorkerCmd); len(fields) > 0 {
+	if fields := splitCommandLine(m.opts.WorkerCmd); len(fields) > 0 {
 		return exec.CommandContext(ctx, fields[0], fields[1:]...)
 	}
 	return exec.CommandContext(ctx, "uv", "run", "--native-tls", "--project", m.opts.EnvDir,
@@ -586,6 +621,35 @@ func (m *Manager) workerCommand(ctx context.Context) *exec.Cmd {
 		"--engine", m.opts.Engine,
 		"--models-dir", m.opts.ModelsDir,
 		"--threads", strconv.Itoa(m.opts.Threads))
+}
+
+// splitCommandLine splits a command line on spaces and tabs. Double quotes group
+// an argument, so a Windows path with spaces can be quoted; backslashes are
+// literal.
+func splitCommandLine(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote, have := false, false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			have = true
+		case (r == ' ' || r == '\t') && !inQuote:
+			if have {
+				out = append(out, cur.String())
+				cur.Reset()
+				have = false
+			}
+		default:
+			cur.WriteRune(r)
+			have = true
+		}
+	}
+	if have {
+		out = append(out, cur.String())
+	}
+	return out
 }
 
 // pcmBuffer is a bounded in-memory FIFO between ffmpeg and the worker

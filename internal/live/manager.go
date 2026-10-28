@@ -164,6 +164,7 @@ type sessionMeta struct {
 	OwnerUserID      *uint     `json:"owner_user_id,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	ReceivedAudioSec float64   `json:"received_audio_sec,omitempty"` // saved when the session closes
+	LastSeq          *int      `json:"last_seq,omitempty"`           // highest seq the client recorded, saved at stop
 }
 
 // asrStats is the live ASR progress of a session
@@ -184,7 +185,7 @@ type session struct {
 	dir  string
 	meta sessionMeta
 
-	mu          sync.Mutex // guards store, status, lastChunkAt
+	mu          sync.Mutex // guards store, status, lastChunkAt, meta.LastSeq and session.json writes
 	store       *chunkStore
 	status      string
 	lastChunkAt time.Time
@@ -197,6 +198,7 @@ type session struct {
 	nextSegSeq int
 	resumeAt   float64 // end of the last final segment
 	activity   time.Time
+	run        *runEvents // the run with a worker in progress, nil when none
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -211,22 +213,27 @@ type Manager struct {
 	opts Options
 	env  *pythonEnv
 
-	ffmpeg          string
-	decoderCmd      []string // tests: replaces the ffmpeg decode command
-	drainTimeout    time.Duration
-	janitorInterval time.Duration
+	ffmpeg           string
+	decoderCmd       []string // tests: replaces the ffmpeg decode command
+	drainTimeout     time.Duration
+	maxDrain         time.Duration
+	modelLoadTimeout time.Duration
+	janitorInterval  time.Duration
 
 	ctx       context.Context
 	cancel    context.CancelFunc
 	startedAt time.Time
 
 	mu              sync.Mutex
-	sessions        map[string]*session
+	sessions        map[string]*session // every open session is recording or finalizing
 	retranscribe    RetranscribeFunc
-	pendingFinalize []string // finalizing when the server stopped
+	pendingFinalize []string // finalizing when the server stopped; resumed one at a time
 
-	wg sync.WaitGroup
+	wg sync.WaitGroup // janitor, finalizes and environment preparation
 }
+
+// errBusy is returned by a background finalize while a session is open
+var errBusy = errors.New("a live session is recording or finalizing")
 
 // NewManager creates a live session manager. Call Recover, then Start.
 func NewManager(db *gorm.DB, opts Options) *Manager {
@@ -249,16 +256,18 @@ func NewManager(db *gorm.DB, opts Options) *Manager {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		db:              db,
-		opts:            opts,
-		env:             newPythonEnv(opts.EnvDir, opts.WorkerScript, opts.Pyproject, strings.TrimSpace(opts.WorkerCmd) != ""),
-		ffmpeg:          "ffmpeg",
-		drainTimeout:    drainTimeout,
-		janitorInterval: janitorInterval,
-		ctx:             ctx,
-		cancel:          cancel,
-		startedAt:       time.Now(),
-		sessions:        make(map[string]*session),
+		db:               db,
+		opts:             opts,
+		env:              newPythonEnv(opts.EnvDir, opts.WorkerScript, opts.Pyproject, strings.TrimSpace(opts.WorkerCmd) != ""),
+		ffmpeg:           "ffmpeg",
+		drainTimeout:     drainTimeout,
+		maxDrain:         maxDrain,
+		modelLoadTimeout: modelLoadTimeout,
+		janitorInterval:  janitorInterval,
+		ctx:              ctx,
+		cancel:           cancel,
+		startedAt:        time.Now(),
+		sessions:         make(map[string]*session),
 	}
 }
 
@@ -302,24 +311,27 @@ func (m *Manager) PrepareEnvironment() {
 		logger.Info("Live worker command override active", "LIVE_WORKER_CMD", m.opts.WorkerCmd)
 		return
 	}
-	m.env.ensure(m.ctx)
+	m.ensureEnv()
 }
 
-// Start resumes finalizations cut off by a restart and starts the janitor. It
-// also starts environment preparation if PrepareEnvironment was not called.
-func (m *Manager) Start() {
-	m.env.ensure(m.ctx)
-
+// ensureEnv starts environment preparation (if needed) as a manager goroutine, so
+// Shutdown waits until its uv commands are killed. Checking for shutdown under
+// m.mu keeps the WaitGroup Add ordered before Shutdown's Wait.
+func (m *Manager) ensureEnv() {
 	m.mu.Lock()
-	pending := m.pendingFinalize
-	m.pendingFinalize = nil
-	m.mu.Unlock()
-	for _, id := range pending {
-		logger.Info("Resuming interrupted live session finalize", "job_id", id)
-		if _, err := m.Finalize(m.ctx, id); err != nil {
-			logger.Warn("Failed to resume live session finalize", "job_id", id, "error", err)
-		}
+	defer m.mu.Unlock()
+	if m.ctx.Err() != nil {
+		return
 	}
+	m.env.ensure(m.ctx, &m.wg)
+}
+
+// Start resumes the first finalization cut off by a restart (the janitor resumes
+// the others, one at a time) and starts the janitor. It also starts environment
+// preparation if PrepareEnvironment was not called.
+func (m *Manager) Start() {
+	m.ensureEnv()
+	m.resumePending()
 
 	m.wg.Add(1)
 	go func() {
@@ -425,7 +437,7 @@ func (m *Manager) CreateSession(ctx context.Context, req CreateRequest) (*models
 	m.sessions[id] = s
 	m.mu.Unlock()
 	s.startPipeline()
-	m.env.ensure(m.ctx) // retry a failed environment setup
+	m.ensureEnv() // retry a failed environment setup
 
 	logger.Info("Live session started", "job_id", id, "title", title)
 	return &job, nil
@@ -521,68 +533,134 @@ func (m *Manager) State(ctx context.Context, id string, after int) (*State, erro
 // Stop finalizes a session after checking that the server has every chunk up to
 // lastSeq. It returns the resulting live status.
 func (m *Manager) Stop(ctx context.Context, id string, lastSeq int) (string, error) {
-	return m.close(ctx, id, &lastSeq)
+	return m.close(ctx, id, &lastSeq, false)
 }
 
 // Finalize finalizes a session without the client, using whatever chunks arrived.
 func (m *Manager) Finalize(ctx context.Context, id string) (string, error) {
-	return m.close(ctx, id, nil)
+	return m.close(ctx, id, nil, false)
 }
 
-func (m *Manager) close(ctx context.Context, id string, lastSeq *int) (string, error) {
-	m.mu.Lock()
-	s := m.sessions[id]
-	if s == nil {
-		if m.ctx.Err() != nil {
-			m.mu.Unlock()
-			return "", fmt.Errorf("server is shutting down")
-		}
-		job, err := m.findLiveJob(ctx, id)
-		if err != nil {
-			m.mu.Unlock()
+// close finalizes a session. A background close (janitor, resumed finalize) never
+// touches an open session: it returns errBusy while any session is open, so
+// background finalizes run one at a time and never while a meeting is live.
+func (m *Manager) close(ctx context.Context, id string, lastSeq *int, background bool) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		switch job.LiveStatus {
-		case models.LiveStatusFinalized:
+		m.mu.Lock()
+		if background && len(m.sessions) > 0 {
 			m.mu.Unlock()
-			return job.LiveStatus, nil
-		case models.LiveStatusRecording, models.LiveStatusInterrupted, models.LiveStatusFinalizing, models.LiveStatusFailed:
-		default:
-			m.mu.Unlock()
-			return "", &Error{Code: CodeClosed, LiveStatus: job.LiveStatus}
+			return "", errBusy
 		}
-		if lastSeq != nil {
-			if next, _, err := indexSummary(m.jobDir(job)); err == nil && next <= *lastSeq {
-				m.mu.Unlock()
-				return "", &Error{Code: CodeMissingChunks, NextSeq: next}
-			}
+		s := m.sessions[id]
+		if s == nil {
+			return m.closeFromDisk(ctx, id, lastSeq, background) // unlocks m.mu
 		}
-		s, err = m.loadSession(ctx, job)
-		if err != nil {
-			m.mu.Unlock()
+		m.mu.Unlock()
+
+		s.mu.Lock()
+		switch s.status {
+		case models.LiveStatusFinalizing, models.LiveStatusFinalized:
+			status := s.status
+			s.mu.Unlock()
+			return status, nil
+		case models.LiveStatusInterrupted, models.LiveStatusFailed:
+			// A janitor suspend (or a failed finalize) is removing the session. Once
+			// it is gone the next pass finalizes it from disk.
+			s.mu.Unlock()
+			continue
+		}
+		if lastSeq != nil && s.store.nextSeq <= *lastSeq {
+			next := s.store.nextSeq
+			s.mu.Unlock()
+			return "", &Error{Code: CodeMissingChunks, NextSeq: next}
+		}
+		// Every acknowledged chunk is durable before the stop is accepted.
+		if err := s.store.sync(); err != nil {
+			s.mu.Unlock()
 			return "", err
 		}
 		s.status = models.LiveStatusFinalizing
-		m.sessions[id] = s
-		m.mu.Unlock()
+		s.setLastSeqLocked(lastSeq)
+		s.mu.Unlock()
+		if lastSeq != nil {
+			s.saveProgress()
+		}
 		return m.beginFinalize(ctx, s)
 	}
-	m.mu.Unlock()
+}
 
-	s.mu.Lock()
-	switch s.status {
-	case models.LiveStatusFinalizing, models.LiveStatusFinalized:
-		status := s.status
-		s.mu.Unlock()
-		return status, nil
+// closeFromDisk finalizes a session that is not open. It is called with m.mu held,
+// which it releases; holding it while the session is loaded keeps a chunk from
+// reopening the session meanwhile.
+func (m *Manager) closeFromDisk(ctx context.Context, id string, lastSeq *int, background bool) (string, error) {
+	if m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return "", fmt.Errorf("server is shutting down")
 	}
-	if lastSeq != nil && s.store.nextSeq <= *lastSeq {
+	job, err := m.findLiveJob(ctx, id)
+	if err != nil {
+		m.mu.Unlock()
+		return "", err
+	}
+	switch job.LiveStatus {
+	case models.LiveStatusFinalized:
+		m.mu.Unlock()
+		return job.LiveStatus, nil
+	case models.LiveStatusRecording, models.LiveStatusInterrupted, models.LiveStatusFinalizing, models.LiveStatusFailed:
+	default:
+		m.mu.Unlock()
+		return "", &Error{Code: CodeClosed, LiveStatus: job.LiveStatus}
+	}
+	if background && job.LiveStatus != models.LiveStatusInterrupted && job.LiveStatus != models.LiveStatusFinalizing {
+		m.mu.Unlock()
+		return job.LiveStatus, nil
+	}
+	if lastSeq != nil {
+		if next, _, err := indexSummary(m.jobDir(job)); err == nil && next <= *lastSeq {
+			m.mu.Unlock()
+			return "", &Error{Code: CodeMissingChunks, NextSeq: next}
+		}
+	}
+	s, err := m.loadSession(ctx, job)
+	if err != nil {
+		m.mu.Unlock()
+		return "", err
+	}
+
+	// Check again on what the store kept. A finalize resumed after a restart checks
+	// the last seq its client reported at stop: acknowledged chunks lost at a power
+	// loss make the session resumable again, so the client can upload them.
+	check, resumed := lastSeq, lastSeq == nil && job.LiveStatus == models.LiveStatusFinalizing
+	if resumed {
+		check = s.meta.LastSeq
+	}
+	if check != nil && s.store.nextSeq <= *check {
 		next := s.store.nextSeq
-		s.mu.Unlock()
-		return "", &Error{Code: CodeMissingChunks, NextSeq: next}
+		_ = s.store.close()
+		if !resumed {
+			m.mu.Unlock()
+			return "", &Error{Code: CodeMissingChunks, NextSeq: next}
+		}
+		err := m.setLiveStatus(ctx, id, models.LiveStatusInterrupted)
+		m.mu.Unlock()
+		if err != nil {
+			return "", err
+		}
+		logger.Warn("Live session lost chunks the client sent before stop; waiting for the client to resume",
+			"job_id", id, "next_seq", next, "last_seq", *check)
+		return models.LiveStatusInterrupted, nil
 	}
+
 	s.status = models.LiveStatusFinalizing
-	s.mu.Unlock()
+	s.setLastSeqLocked(lastSeq)
+	m.sessions[id] = s
+	m.mu.Unlock()
+	if lastSeq != nil {
+		s.saveProgress()
+	}
 	return m.beginFinalize(ctx, s)
 }
 
@@ -655,8 +733,10 @@ func (m *Manager) List(ctx context.Context, statuses []string) ([]Summary, error
 }
 
 // sweep is the janitor pass: it suspends open sessions that stopped receiving
-// chunks, drops sessions whose job was deleted, and finalizes interrupted
-// sessions idle for longer than AbandonAfter.
+// chunks, drops sessions whose job was deleted, and then starts at most one
+// background finalize, only while no session is open: a finalize cut off by a
+// restart, else an interrupted session that received no chunk for longer than
+// AbandonAfter. Later sweeps pick up the rest.
 func (m *Manager) sweep() {
 	now := time.Now()
 
@@ -687,43 +767,89 @@ func (m *Manager) sweep() {
 		}
 	}
 
+	if m.resumePending() || m.anyOpen() {
+		return
+	}
+
 	var jobs []models.TranscriptionJob
 	if err := m.db.Select("id", "recording_path", "updated_at").
 		Where("source = ? AND live_status = ?", models.SourceLive, models.LiveStatusInterrupted).
+		Order("created_at asc").
 		Find(&jobs).Error; err != nil {
 		logger.Warn("Live janitor failed to list interrupted sessions", "error", err)
 		return
 	}
 	for i := range jobs {
 		job := &jobs[i]
-		if m.get(job.ID) != nil {
+		// Idle since the last chunk (the index is written for every chunk; a
+		// suspend bumps updated_at), but never less than since this server started.
+		last := m.startedAt
+		if info, err := os.Stat(filepath.Join(m.jobDir(job), indexFileName)); err == nil {
+			if info.ModTime().After(last) {
+				last = info.ModTime()
+			}
+		} else if job.UpdatedAt.After(last) {
+			last = job.UpdatedAt
+		}
+		if now.Sub(last) <= m.opts.AbandonAfter {
 			continue
 		}
-		last := job.UpdatedAt
-		if m.startedAt.After(last) {
-			last = m.startedAt
-		}
-		if info, err := os.Stat(filepath.Join(m.jobDir(job), indexFileName)); err == nil && info.ModTime().After(last) {
-			last = info.ModTime()
-		}
-		if now.Sub(last) > m.opts.AbandonAfter {
+		status, err := m.close(m.ctx, job.ID, nil, true)
+		switch {
+		case errors.Is(err, errBusy):
+			return
+		case err != nil:
+			logger.Warn("Failed to finalize abandoned live session", "job_id", job.ID, "error", err)
+		case status == models.LiveStatusFinalizing:
 			logger.Info("Finalizing abandoned live session", "job_id", job.ID)
-			if _, err := m.Finalize(m.ctx, job.ID); err != nil {
-				logger.Warn("Failed to finalize abandoned live session", "job_id", job.ID, "error", err)
-			}
+			return
+		}
+	}
+}
+
+// resumePending starts the next finalize that a restart cut off. It returns true
+// when nothing else should start now: that finalize is running, or a session is
+// open.
+func (m *Manager) resumePending() bool {
+	for {
+		m.mu.Lock()
+		if len(m.pendingFinalize) == 0 {
+			m.mu.Unlock()
+			return false
+		}
+		id := m.pendingFinalize[0]
+		m.mu.Unlock()
+
+		status, err := m.close(m.ctx, id, nil, true)
+		if errors.Is(err, errBusy) {
+			return true
+		}
+		m.mu.Lock()
+		if len(m.pendingFinalize) > 0 && m.pendingFinalize[0] == id {
+			m.pendingFinalize = m.pendingFinalize[1:]
+		}
+		m.mu.Unlock()
+		switch {
+		case err != nil:
+			logger.Warn("Failed to resume live session finalize", "job_id", id, "error", err)
+		case status == models.LiveStatusFinalizing:
+			logger.Info("Resuming interrupted live session finalize", "job_id", id)
+			return true
 		}
 	}
 }
 
 // suspend stops a recording session's pipeline and closes its files. With
-// markInterrupted it stays resumable (live_status=interrupted). The manager lock
-// is held throughout so a concurrent chunk cannot reopen the files meanwhile.
+// markInterrupted it stays resumable (live_status=interrupted), and only a session
+// still idle for longer than AbandonAfter is suspended. The manager lock is held
+// throughout so a concurrent chunk, Stop or janitor finalize cannot reopen the
+// files meanwhile.
 func (m *Manager) suspend(s *session, markInterrupted bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	s.mu.Lock()
-	if s.status != models.LiveStatusRecording {
+	if s.status != models.LiveStatusRecording || (markInterrupted && time.Since(s.lastChunkAt) <= m.opts.AbandonAfter) {
 		s.mu.Unlock()
 		return
 	}
@@ -770,6 +896,13 @@ func (m *Manager) get(id string) *session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.sessions[id]
+}
+
+// anyOpen reports whether any session is open (recording or finalizing)
+func (m *Manager) anyOpen() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions) > 0
 }
 
 func (m *Manager) removeSession(s *session) {
@@ -1005,6 +1138,17 @@ func (s *session) setReceived(sec float64) {
 	s.touchLocked()
 }
 
+// backlog is the decoded audio the worker has not processed yet
+func (s *session) backlog() time.Duration {
+	s.asrMu.Lock()
+	defer s.asrMu.Unlock()
+	sec := s.asr.receivedSec - s.asr.processedSec
+	if sec < 0 {
+		sec = 0
+	}
+	return time.Duration(sec * float64(time.Second))
+}
+
 func (s *session) setASRState(state, errMsg string) {
 	s.asrMu.Lock()
 	defer s.asrMu.Unlock()
@@ -1013,16 +1157,27 @@ func (s *session) setASRState(state, errMsg string) {
 	s.asr.partial = nil
 }
 
-// saveProgress records the decoded audio length in session.json, so the state of
-// a closed session still reports it
+// saveProgress records the decoded audio length (and the client's last seq) in
+// session.json, so the state of a closed session still reports it
 func (s *session) saveProgress() {
 	s.asrMu.Lock()
 	received := s.asr.receivedSec
 	s.asrMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	meta := s.meta
 	meta.ReceivedAudioSec = round3(received)
 	if err := writeMeta(s.dir, meta); err != nil {
 		logger.Warn("Failed to save live session progress", "job_id", s.id, "error", err)
+	}
+}
+
+// setLastSeqLocked records the highest seq the client recorded, when it sent one.
+// s.mu must be held (or s not yet shared).
+func (s *session) setLastSeqLocked(lastSeq *int) {
+	if lastSeq != nil {
+		v := *lastSeq
+		s.meta.LastSeq = &v
 	}
 }
 
@@ -1038,7 +1193,7 @@ func (s *session) engine() string {
 	return s.asr.engine
 }
 
-// writeMeta atomically writes session.json
+// writeMeta atomically and durably writes session.json
 func writeMeta(dir string, meta sessionMeta) error {
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -1046,7 +1201,7 @@ func writeMeta(dir string, meta sessionMeta) error {
 	}
 	path := filepath.Join(dir, metaFileName)
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := writeFileSync(tmp, data); err != nil {
 		return fmt.Errorf("failed to write session metadata: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {

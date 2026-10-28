@@ -77,6 +77,11 @@ export interface LiveSnapshot {
 	recordedChunks: number;
 	uploadedChunks: number;
 	localSaveFailed: boolean;
+	/**
+	 * Chunks only this tab's memory holds: IndexedDB refused them, the server has not confirmed
+	 * them and they are not in a downloaded file yet. Leaving the meeting would lose them.
+	 */
+	memoryOnlyChunks: number;
 	upload: UploaderStatus | null;
 	serverReachable: boolean;
 	pollError: string | null;
@@ -119,6 +124,7 @@ function initialSnapshot(): LiveSnapshot {
 		recordedChunks: 0,
 		uploadedChunks: 0,
 		localSaveFailed: false,
+		memoryOnlyChunks: 0,
 		upload: null,
 		serverReachable: true,
 		pollError: null,
@@ -161,6 +167,23 @@ function acquireSessionLock(localId: string): Promise<(() => void) | null> {
 				return new Promise<void>((release) => resolve(() => release()));
 			})
 			.catch(() => resolve(noop));
+	});
+}
+
+/**
+ * Runs task while holding the session's lock, so no tab can start working on the meeting
+ * meanwhile. Resolves false, without running task, when another tab holds the lock.
+ */
+export async function withSessionLock(localId: string, task: () => Promise<void>): Promise<boolean> {
+	const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+	if (!locks) {
+		await task();
+		return true;
+	}
+	return locks.request(lockName(localId), { ifAvailable: true }, async (lock) => {
+		if (!lock) return false;
+		await task();
+		return true;
 	});
 }
 
@@ -209,10 +232,15 @@ export class LiveSessionController {
 	private persistChain: Promise<void> = Promise.resolve();
 	/** Chunks that could not be written to IndexedDB, kept in memory until acknowledged. */
 	private readonly memoryChunks = new Map<number, Blob>();
+	/** Highest seq included in a recording file downloaded from this tab, -1 when none. */
+	private downloadedThrough = -1;
+	/** The session record could not be written at start; retried after each stored chunk. */
+	private sessionRecordMissing = false;
 
 	private uploader: ChunkUploader | null = null;
 	private pollTimer: number | null = null;
-	private pollInFlight = false;
+	/** Run of the state request in flight, if any; a stale run's request never blocks a new run. */
+	private pollInFlightRun: number | null = null;
 	private lastSegSeq = -1;
 	private readonly segmentSeqs = new Set<number>();
 	private finalHandled = false;
@@ -253,7 +281,8 @@ export class LiveSessionController {
 		this.noticeListeners.forEach((listener) => listener(notice));
 	}
 
-	private resetSession(patch: Partial<LiveSnapshot>): void {
+	/** keepMemory: retrying this tab's own meeting, whose memory-only chunks must survive. */
+	private resetSession(patch: Partial<LiveSnapshot>, keepMemory = false): void {
 		this.localId = null;
 		this.recorder = null;
 		this.recorderStopped = null;
@@ -261,12 +290,39 @@ export class LiveSessionController {
 		this.nextSeq = 0;
 		this.lastSeq = -1;
 		this.persistChain = Promise.resolve();
-		this.memoryChunks.clear();
+		if (!keepMemory) {
+			this.memoryChunks.clear();
+			this.downloadedThrough = -1;
+		}
+		this.sessionRecordMissing = false;
 		this.lastSegSeq = -1;
 		this.segmentSeqs.clear();
 		this.finalHandled = false;
-		this.snapshot = { ...initialSnapshot(), recoverableCount: this.snapshot.recoverableCount, ...patch };
+		this.snapshot = {
+			...initialSnapshot(),
+			recoverableCount: this.snapshot.recoverableCount,
+			memoryOnlyChunks: this.memoryOnlyCount(),
+			...patch,
+		};
 		this.listeners.forEach((listener) => listener());
+	}
+
+	private memoryOnlyCount(): number {
+		let count = 0;
+		for (const seq of this.memoryChunks.keys()) {
+			if (seq > this.downloadedThrough) count++;
+		}
+		return count;
+	}
+
+	/** True, after telling the user, when leaving the meeting now would lose memory-only audio. */
+	private blockedByMemoryOnlyAudio(): boolean {
+		if (this.memoryOnlyCount() === 0) return false;
+		this.notify({
+			title: "Some audio is only in this tab's memory",
+			description: "The browser could not store it. Download the recording first.",
+		});
+		return true;
 	}
 
 	// ----- public actions ------------------------------------------------------------
@@ -348,6 +404,7 @@ export class LiveSessionController {
 			if (run !== this.runId) throw new Error("Start was cancelled.");
 
 			this.localId = localId;
+			this.sessionRecordMissing = localSaveFailed;
 			this.releaseLock = releaseLock;
 			this.recorder = recorder;
 			recorder.ondataavailable = (event) => this.handleChunk(run, event.data);
@@ -439,21 +496,32 @@ export class LiveSessionController {
 
 		const run = ++this.runId;
 		this.teardown();
-		this.resetSession({
-			phase: "draining",
-			localId,
-			serverId: session.serverId,
-			title: session.title,
-			mimeType: session.mimeType,
-			autoRetranscribe: !!session.autoRetranscribe,
-			resumed: true,
-			recordedChunks: session.lastSeq + 1,
-			uploadedChunks: Math.max(0, session.ackedSeq + 1),
-		});
+		// Retrying this tab's own meeting: chunks IndexedDB refused exist only in memory, so keep
+		// them, and count them (and what this tab knows was recorded) towards the last seq.
+		const ownMeeting = localId === this.localId;
+		let lastSeq = session.lastSeq;
+		if (ownMeeting) {
+			lastSeq = Math.max(lastSeq, this.lastSeq);
+			for (const seq of this.memoryChunks.keys()) lastSeq = Math.max(lastSeq, seq);
+		}
+		this.resetSession(
+			{
+				phase: "draining",
+				localId,
+				serverId: session.serverId,
+				title: session.title,
+				mimeType: session.mimeType,
+				autoRetranscribe: !!session.autoRetranscribe,
+				resumed: true,
+				recordedChunks: lastSeq + 1,
+				uploadedChunks: Math.max(0, session.ackedSeq + 1),
+			},
+			ownMeeting,
+		);
 		this.localId = localId;
 		this.releaseLock = releaseLock;
-		this.lastSeq = session.lastSeq;
-		this.nextSeq = session.lastSeq + 1;
+		this.lastSeq = lastSeq;
+		this.nextSeq = lastSeq + 1;
 		this.activateEnvironment();
 
 		let startSeq = session.ackedSeq + 1;
@@ -495,15 +563,15 @@ export class LiveSessionController {
 			localId,
 			serverId: session.serverId,
 			startSeq,
-			availableSeq: session.lastSeq,
+			availableSeq: lastSeq,
 			title: session.title,
 			mimeType: session.mimeType,
 			autoRetranscribe: !!session.autoRetranscribe,
 		});
-		this.uploader.finish(session.lastSeq);
+		this.uploader.finish(lastSeq);
 		this.uploader.start();
 		this.startPolling(run);
-		await this.completeUpload(run, session.lastSeq);
+		await this.completeUpload(run, lastSeq);
 	};
 
 	/** Retry a failed meeting (re-runs the resume path). */
@@ -517,18 +585,23 @@ export class LiveSessionController {
 	keepLocally = (): void => {
 		const phase = this.snapshot.phase;
 		if (phase !== "draining" && phase !== "finalizing") return;
+		if (this.blockedByMemoryOnlyAudio()) return;
+		// Past the guard, any chunk still only in memory is in a file the user downloaded.
+		const info = this.sessionRecordMissing
+			? "This browser could not save the meeting record, so the meeting is not listed under \"Resume upload\". The server keeps the audio it received."
+			: this.memoryChunks.size > 0
+				? "The meeting is saved in this browser, except audio the browser could not store, which is in the recording you downloaded. Use \"Resume upload\" below when the server is reachable."
+				: "The meeting is saved in this browser. Use \"Resume upload\" below when the server is reachable.";
 		this.runId++;
 		this.teardown();
-		this.resetSession({
-			phase: "idle",
-			info: "The meeting is saved in this browser. Use \"Resume upload\" below when the server is reachable.",
-		});
+		this.resetSession({ phase: "idle", info });
 		void this.refreshRecoverable();
 	};
 
 	/** Back to the start screen after a finished or failed meeting. */
 	reset = (): void => {
 		if (isActivePhase(this.snapshot.phase)) return;
+		if (this.blockedByMemoryOnlyAudio()) return;
 		this.runId++;
 		this.teardown();
 		this.resetSession({ phase: "idle" });
@@ -537,6 +610,38 @@ export class LiveSessionController {
 
 	dismissMessage = (): void => {
 		if (this.snapshot.error || this.snapshot.info) this.set({ error: null, info: null });
+	};
+
+	/**
+	 * Downloads this meeting as this browser holds it: the chunks stored in IndexedDB merged,
+	 * by seq, with the ones only in memory (IndexedDB refused them).
+	 */
+	downloadRecording = async (): Promise<void> => {
+		const localId = this.localId;
+		if (!localId) throw new Error("No meeting is open");
+		const run = this.runId;
+		const { title, mimeType } = this.snapshot;
+		// Once the persist chain settles, every chunk up to `through` is stored or in memory.
+		const through = this.nextSeq - 1;
+		await this.persistChain;
+		if (run !== this.runId) throw new Error("The meeting changed while preparing the download");
+		const memory = new Map(this.memoryChunks);
+		const bySeq = new Map<number, Blob>();
+		try {
+			for (const chunk of await store.readChunkEntries(localId)) bySeq.set(chunk.seq, chunk.blob);
+		} catch (error) {
+			// IndexedDB may be unusable altogether, which is exactly when memory holds the audio.
+			if (memory.size === 0) throw error;
+			console.warn("Live: could not read the chunks saved in this browser", error);
+		}
+		memory.forEach((blob, seq) => bySeq.set(seq, blob));
+		const blobs = Array.from(bySeq.entries())
+			.sort((a, b) => a[0] - b[0])
+			.map(([, blob]) => blob);
+		store.saveRecordingFile(blobs, title, mimeType);
+		if (run !== this.runId) return;
+		this.downloadedThrough = Math.max(this.downloadedThrough, through);
+		this.set({ memoryOnlyChunks: this.memoryOnlyCount() });
 	};
 
 	/** Skip the current backoff wait for uploads and stop requests. */
@@ -642,11 +747,39 @@ export class LiveSessionController {
 				saved = false;
 				console.error("Live: could not save chunk locally", seq, error);
 			}
-			if (!saved) this.memoryChunks.set(seq, blob);
 			if (run !== this.runId) return;
-			this.set({ recordedChunks: seq + 1, localSaveFailed: !saved });
+			if (!saved) this.memoryChunks.set(seq, blob);
+			// Without the session record the stored chunks are invisible to "Resume upload" and
+			// never cleaned up, so keep trying to create it; the warning stays until it exists.
+			else if (this.sessionRecordMissing) await this.createMissingRecord(localId, seq);
+			if (run !== this.runId) return;
+			this.set({
+				recordedChunks: seq + 1,
+				localSaveFailed: !saved || this.sessionRecordMissing,
+				memoryOnlyChunks: this.memoryOnlyCount(),
+			});
 			this.uploader?.push(seq);
 		});
+	}
+
+	private async createMissingRecord(localId: string, lastSeq: number): Promise<void> {
+		const snapshot = this.snapshot;
+		try {
+			await store.putSession({
+				id: localId,
+				title: snapshot.title,
+				mimeType: snapshot.mimeType,
+				createdAt: snapshot.startedAt ?? Date.now(),
+				state: this.stopRequested ? "stopping" : "recording",
+				lastSeq,
+				ackedSeq: snapshot.uploadedChunks - 1,
+				serverId: snapshot.serverId,
+				autoRetranscribe: snapshot.autoRetranscribe,
+			});
+			this.sessionRecordMissing = false;
+		} catch (error) {
+			console.error("Live: could not create the local session", error);
+		}
 	}
 
 	private handleRecorderStopped(run: number): void {
@@ -731,7 +864,7 @@ export class LiveSessionController {
 				for (const seq of Array.from(this.memoryChunks.keys())) {
 					if (seq <= ackedSeq) this.memoryChunks.delete(seq);
 				}
-				this.set({ uploadedChunks: ackedSeq + 1 });
+				this.set({ uploadedChunks: ackedSeq + 1, memoryOnlyChunks: this.memoryOnlyCount() });
 				this.persistAck(localId, ackedSeq);
 			},
 			onStatus: (status) => {
@@ -844,7 +977,15 @@ export class LiveSessionController {
 		}
 		if (run !== this.runId) return;
 		this.teardown();
-		this.set({ phase: "finalized", partial: null, incompleteOnServer: !complete, serverReachable: true });
+		// The server holds every chunk, so audio kept in memory is no longer needed.
+		if (complete) this.memoryChunks.clear();
+		this.set({
+			phase: "finalized",
+			partial: null,
+			incompleteOnServer: !complete,
+			serverReachable: true,
+			memoryOnlyChunks: this.memoryOnlyCount(),
+		});
 		void this.refreshRecoverable();
 	}
 
@@ -860,7 +1001,7 @@ export class LiveSessionController {
 	// ----- live text polling -----------------------------------------------------------
 
 	private startPolling(run: number): void {
-		if (this.pollTimer !== null || this.pollInFlight) return;
+		if (this.pollTimer !== null || this.pollInFlightRun === run) return;
 		this.pollTimer = window.setTimeout(() => void this.pollTick(run), 0);
 	}
 
@@ -870,7 +1011,7 @@ export class LiveSessionController {
 	}
 
 	private pollNow(run: number): void {
-		if (this.pollInFlight) return;
+		if (this.pollInFlightRun === run) return;
 		this.stopPolling();
 		void this.pollTick(run);
 	}
@@ -880,7 +1021,7 @@ export class LiveSessionController {
 		if (run !== this.runId || !isPollingPhase(this.snapshot.phase)) return;
 		const serverId = this.snapshot.serverId;
 		if (serverId) {
-			this.pollInFlight = true;
+			this.pollInFlightRun = run;
 			try {
 				const state = await getSessionState(serverId, this.lastSegSeq);
 				this.applyState(run, state);
@@ -889,7 +1030,7 @@ export class LiveSessionController {
 					this.set({ pollError: describeError(error), serverReachable: !isServerDown(error) });
 				}
 			} finally {
-				this.pollInFlight = false;
+				if (this.pollInFlightRun === run) this.pollInFlightRun = null;
 			}
 		}
 		if (run !== this.runId || !isPollingPhase(this.snapshot.phase) || this.pollTimer !== null) return;

@@ -1,4 +1,5 @@
 import { LiveApiError, describeError, isRetryable, isServerDown, uploadChunk } from "./api";
+import { errorMessage } from "./format";
 
 // Strictly sequential chunk uploader. One request in flight at a time, in seq order,
 // retrying forever with exponential backoff until it is disposed. The server is the
@@ -7,6 +8,8 @@ import { LiveApiError, describeError, isRetryable, isServerDown, uploadChunk } f
 
 export const RETRY_START_MS = 250;
 export const RETRY_MAX_MS = 10_000;
+/** Extra reads of a chunk that came back missing before the upload gives up on it. */
+const MISSING_REREADS = 2;
 
 export interface UploaderStatus {
 	/** Highest seq the server confirmed; everything up to it is safe on the server. */
@@ -48,6 +51,7 @@ export class ChunkUploader {
 	/** Last seq of the recording, set once the recorder has stopped. */
 	private finalSeq: number | null = null;
 	private delay = RETRY_START_MS;
+	private missingReads = 0;
 	private running = false;
 	private disposed = false;
 	private outcome: DrainResult | null = null;
@@ -165,17 +169,29 @@ export class ChunkUploader {
 			}
 
 			const seq = this.nextSeq;
-			let blob: Blob | null = null;
+			let blob: Blob | null;
 			try {
 				blob = await this.options.readChunk(seq);
 			} catch (error) {
+				// A read can fail transiently (e.g. the IndexedDB connection was closed); the chunk
+				// is still stored, so read it again later instead of ending the upload.
 				console.error("Live: could not read chunk", seq, error);
+				if (this.disposed) return;
+				this.update({ lastError: `Could not read chunk ${seq} from this browser's storage: ${errorMessage(error)}` });
+				await this.pause();
+				continue;
 			}
 			if (this.disposed) return;
 			if (!blob) {
+				if (this.missingReads < MISSING_REREADS) {
+					this.missingReads++;
+					await this.pause();
+					continue;
+				}
 				this.fail(`Chunk ${seq} is missing from this browser's storage, so the upload cannot continue.`);
 				return;
 			}
+			this.missingReads = 0;
 
 			try {
 				const ack = await uploadChunk(this.serverId, seq, blob);
@@ -220,6 +236,11 @@ export class ChunkUploader {
 
 	private async backoff(error: unknown): Promise<void> {
 		this.update({ retrying: true, serverReachable: !isServerDown(error), lastError: describeError(error) });
+		await this.pause();
+	}
+
+	/** Waits out the current retry delay and doubles it for the next failure. */
+	private async pause(): Promise<void> {
 		const wait = this.delay;
 		this.delay = Math.min(this.delay * 2, RETRY_MAX_MS);
 		await this.sleep(wait);

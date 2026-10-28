@@ -19,7 +19,14 @@ const (
 	// drainTimeout bounds how long finalize waits for the pipeline without any
 	// progress (worker event or decoded audio) before killing it
 	drainTimeout = 120 * time.Second
-	remuxTimeout = 10 * time.Minute
+	// maxDrain caps the total time finalize lets a ready worker work off its
+	// backlog (twice the backlog at stop, at least drainTimeout). The live text is
+	// a draft: a re-transcription covers whatever was not reached.
+	maxDrain = 15 * time.Minute
+	// modelLoadTimeout bounds the drain while the worker has not reported ready
+	// (it may be downloading or extracting its model, which reports no progress)
+	modelLoadTimeout = 30 * time.Minute
+	remuxTimeout     = 10 * time.Minute
 )
 
 // finalize drains the pipeline, remuxes the recording, materializes the live
@@ -40,7 +47,9 @@ func (m *Manager) finalize(s *session) {
 	closeErr := s.store.close()
 	s.mu.Unlock()
 	if closeErr != nil {
-		logger.Warn("Failed to close live recording cleanly", "job_id", s.id, "error", closeErr)
+		// The recording may not be durable: the client must keep its copy.
+		m.markFailed(s, fmt.Errorf("failed to flush live recording: %w", closeErr))
+		return
 	}
 
 	// 2. Remux to a seekable file; fall back to the raw recording.
@@ -63,10 +72,11 @@ func (m *Manager) finalize(s *session) {
 	}
 	transcript := string(data)
 
-	// 4. Complete the job. If a batch pass was started during the meeting, leave
-	// its status and transcript alone and only record the live pass.
+	// 4. Complete the job, unless a batch pass owns its transcript (queued, running
+	// or completed): then leave its status and transcript alone and only record
+	// the live pass.
 	var job models.TranscriptionJob
-	if err := m.db.Select("id", "status").First(&job, "id = ?", s.id).Error; err != nil {
+	if err := m.db.Select("id", "status", "transcript_source").First(&job, "id = ?", s.id).Error; err != nil {
 		m.markFailed(s, fmt.Errorf("failed to load job: %w", err))
 		return
 	}
@@ -75,8 +85,9 @@ func (m *Manager) finalize(s *session) {
 		"live_status":     models.LiveStatusFinalized,
 		"audio_path":      audioPath,
 	}
-	batchRunning := job.Status == models.StatusPending || job.Status == models.StatusProcessing
-	if !batchRunning {
+	complete := job.Status == models.StatusUploaded || job.Status == models.StatusFailed ||
+		(job.Status == models.StatusCompleted && job.TranscriptSource == models.TranscriptSourceLive)
+	if complete {
 		updates["transcript"] = transcript
 		updates["transcript_source"] = models.TranscriptSourceLive
 		updates["status"] = models.StatusCompleted
@@ -94,7 +105,7 @@ func (m *Manager) finalize(s *session) {
 	logger.Info("Live session finalized", "job_id", s.id, "segments", len(result.Segments), "audio_path", audioPath)
 
 	// 5. Optional high-quality pass through the normal queue.
-	if s.meta.AutoRetranscribe && !batchRunning {
+	if s.meta.AutoRetranscribe && complete {
 		m.mu.Lock()
 		retranscribe := m.retranscribe
 		m.mu.Unlock()
@@ -106,13 +117,17 @@ func (m *Manager) finalize(s *session) {
 	}
 }
 
-// waitDrained waits for the pipeline to finish flushing. A pipeline that makes no
-// progress for drainTimeout is killed. It returns false when the server is
-// shutting down.
+// waitDrained waits for the pipeline to finish flushing. The pipeline is killed,
+// and finalize goes on with the segments so far, when it makes no progress for
+// drainTimeout, when a ready worker has not worked off its backlog within
+// drainLimit, or when the worker has not become ready within modelLoadTimeout. It
+// returns false when the server is shutting down.
 func (m *Manager) waitDrained(s *session) bool {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	start := time.Now()
+	limit := drainLimit(m.drainTimeout, m.maxDrain, s.backlog())
+	since := start // the overall limit runs only while the worker is ready
 	for {
 		select {
 		case <-s.pipeDone:
@@ -121,18 +136,46 @@ func (m *Manager) waitDrained(s *session) bool {
 			<-s.pipeDone
 			return false
 		case <-ticker.C:
-			last := s.lastActivity()
-			if last.Before(start) {
-				last = start
+			now := time.Now()
+			reason := ""
+			if s.workerLoading() {
+				since = now
+				if now.Sub(start) > m.modelLoadTimeout {
+					reason = "worker did not load its model in time"
+				}
+			} else {
+				last := s.lastActivity()
+				if last.Before(start) {
+					last = start
+				}
+				switch {
+				case now.Sub(last) > m.drainTimeout:
+					reason = "no progress"
+				case now.Sub(since) > limit:
+					reason = "backlog not worked off in time"
+				}
 			}
-			if time.Since(last) > m.drainTimeout {
-				logger.Warn("Live pipeline did not flush in time, stopping it", "job_id", s.id)
+			if reason != "" {
+				logger.Warn("Live pipeline did not flush in time, stopping it", "job_id", s.id, "reason", reason)
 				s.cancel()
 				<-s.pipeDone
 				return m.ctx.Err() == nil
 			}
 		}
 	}
+}
+
+// drainLimit is the overall time a ready worker gets to work off a backlog: twice
+// the backlog, at least idle, at most max
+func drainLimit(idle, max, backlog time.Duration) time.Duration {
+	limit := 2 * backlog
+	if limit < idle {
+		limit = idle
+	}
+	if limit > max {
+		limit = max
+	}
+	return limit
 }
 
 // remux copies recording.webm into a seekable recording.final.webm (duration and
@@ -159,6 +202,12 @@ func (m *Manager) remux(ctx context.Context, dir string) (string, error) {
 	if st, err := os.Stat(tmp); err != nil || st.Size() == 0 {
 		_ = os.Remove(tmp)
 		return src, fmt.Errorf("ffmpeg remux produced no output")
+	}
+	// The job points at the result and the client then deletes its copy: make the
+	// data durable before the rename can be.
+	if err := syncFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return src, fmt.Errorf("failed to flush remuxed recording: %w", err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
