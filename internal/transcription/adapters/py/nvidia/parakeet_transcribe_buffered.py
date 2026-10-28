@@ -8,6 +8,7 @@ import argparse
 import json
 import sys
 import os
+import tempfile
 import librosa
 import soundfile as sf
 import numpy as np
@@ -77,7 +78,7 @@ def transcribe_buffered(
 
     # Apply the new decoding strategy (this rebuilds the decoder with our config)
     asr_model.change_decoding_strategy(dec_cfg)
-    print("✓ CUDA graphs disabled successfully")
+    print("CUDA graphs disabled successfully")
 
     print(f"Splitting audio into {chunk_duration_secs}s chunks...")
     chunks, sr = split_audio_file(audio_path, chunk_duration_secs)
@@ -90,8 +91,9 @@ def transcribe_buffered(
     for i, chunk_info in enumerate(chunks):
         print(f"Transcribing chunk {i+1}/{len(chunks)} (duration: {chunk_info['duration']:.1f}s)...")
 
-        # Save chunk to temporary file
-        chunk_path = f"/tmp/chunk_{i}.wav"
+        # Save chunk next to the job output (per-job, and valid on Windows where /tmp doesn't exist)
+        chunk_dir = os.path.dirname(os.path.abspath(output_file)) if output_file else tempfile.gettempdir()
+        chunk_path = os.path.join(chunk_dir, f"chunk_{i}.wav")
         sf.write(chunk_path, chunk_info['audio'], sr)
 
         try:

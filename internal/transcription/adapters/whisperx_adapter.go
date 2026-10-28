@@ -309,8 +309,11 @@ func (w *WhisperXAdapter) PrepareEnvironment(ctx context.Context) error {
 		return fmt.Errorf("failed to create environment directory: %w", err)
 	}
 
-	// Clone WhisperX
-	if err := w.cloneWhisperX(); err != nil {
+	// Clone WhisperX (skip if an earlier attempt already cloned it, so a failed
+	// uv sync can be retried on the next start instead of failing on git clone)
+	if _, err := os.Stat(filepath.Join(whisperxPath, ".git")); err == nil {
+		logger.Info("WhisperX already cloned, retrying dependency setup", "path", whisperxPath)
+	} else if err := w.cloneWhisperX(); err != nil {
 		return fmt.Errorf("failed to clone WhisperX: %w", err)
 	}
 

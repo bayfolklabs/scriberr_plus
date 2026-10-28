@@ -8,6 +8,7 @@ import argparse
 import json
 import sys
 import os
+import tempfile
 import librosa
 import soundfile as sf
 import torch
@@ -85,8 +86,9 @@ def transcribe_buffered(
             file=sys.stderr,
         )
 
-        # Save chunk to temporary file
-        chunk_path = f"/tmp/voxtral_chunk_{i}.wav"
+        # Save chunk next to the job output (per-job, and valid on Windows where /tmp doesn't exist)
+        chunk_dir = os.path.dirname(os.path.abspath(output_file)) if output_file else tempfile.gettempdir()
+        chunk_path = os.path.join(chunk_dir, f"voxtral_chunk_{i}.wav")
         sf.write(chunk_path, chunk_info["audio"], sr)
 
         try:

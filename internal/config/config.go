@@ -41,6 +41,10 @@ type Config struct {
 
 	// Hugging Face configuration
 	HFToken string
+
+	// EnabledAdapters limits which model adapters are registered (and therefore
+	// set up at startup). Empty means all adapters, matching upstream behavior.
+	EnabledAdapters []string
 }
 
 // Load loads configuration from environment variables and .env file
@@ -57,25 +61,50 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:           getEnv("PORT", "8080"),
-		Host:           getEnv("HOST", "0.0.0.0"),
-		Environment:    getEnv("APP_ENV", "development"),
-		AllowedOrigins: strings.Split(getEnv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080"), ","),
-		DatabasePath:   getEnv("DATABASE_PATH", "data/scriberr.db"),
-		JWTSecret:      getJWTSecret(),
-		UploadDir:      getEnv("UPLOAD_DIR", "data/uploads"),
-		TranscriptsDir: getEnv("TRANSCRIPTS_DIR", "data/transcripts"),
-		TempDir:        getEnv("TEMP_DIR", "data/temp"),
-		WhisperXEnv:    getEnv("WHISPERX_ENV", "data/whisperx-env"),
-		SecureCookies:  getEnv("SECURE_COOKIES", defaultSecure) == "true",
-		OpenAIAPIKey:   getEnv("OPENAI_API_KEY", ""),
-		HFToken:        getEnv("HF_TOKEN", ""),
+		Port:            getEnv("PORT", "8080"),
+		Host:            getEnv("HOST", "0.0.0.0"),
+		Environment:     getEnv("APP_ENV", "development"),
+		AllowedOrigins:  strings.Split(getEnv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080"), ","),
+		DatabasePath:    getEnv("DATABASE_PATH", "data/scriberr.db"),
+		JWTSecret:       getJWTSecret(),
+		UploadDir:       getEnv("UPLOAD_DIR", "data/uploads"),
+		TranscriptsDir:  getEnv("TRANSCRIPTS_DIR", "data/transcripts"),
+		TempDir:         getEnv("TEMP_DIR", "data/temp"),
+		WhisperXEnv:     getEnv("WHISPERX_ENV", "data/whisperx-env"),
+		SecureCookies:   getEnv("SECURE_COOKIES", defaultSecure) == "true",
+		OpenAIAPIKey:    getEnv("OPENAI_API_KEY", ""),
+		HFToken:         getEnv("HF_TOKEN", ""),
+		EnabledAdapters: splitList(getEnv("SCRIBERR_ADAPTERS", "")),
 	}
 }
 
 // IsProduction returns true if the environment is production
 func (c *Config) IsProduction() bool {
 	return strings.ToLower(c.Environment) == "production"
+}
+
+// AdapterEnabled reports whether the named model adapter should be registered.
+func (c *Config) AdapterEnabled(name string) bool {
+	if len(c.EnabledAdapters) == 0 {
+		return true
+	}
+	for _, a := range c.EnabledAdapters {
+		if strings.EqualFold(a, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitList splits a comma-separated value, trimming blanks.
+func splitList(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // getEnv gets an environment variable with a default value

@@ -1,0 +1,13 @@
+[project]
+name = "scriberr-live"
+version = "0.1.0"
+description = "Persistent live (streaming) ASR worker for Scriberr live sessions"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # >= 1.13.4: older builds silently mis-decode Nemotron streaming models
+    "sherpa-onnx>=1.13.4",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false

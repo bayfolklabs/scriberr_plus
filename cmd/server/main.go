@@ -228,23 +228,43 @@ func registerAdapters(cfg *config.Config) {
 	// Dedicated environment path for Voxtral (Mistral AI model)
 	voxtralEnvPath := filepath.Join(cfg.WhisperXEnv, "voxtral")
 
+	// SCRIBERR_ADAPTERS (comma-separated) limits which adapters are registered, so a
+	// CPU-only machine can skip multi-GB environments it can't run (e.g. canary, voxtral).
+	if len(cfg.EnabledAdapters) > 0 {
+		logger.Info("Adapter allowlist active", "SCRIBERR_ADAPTERS", cfg.EnabledAdapters)
+	}
+
 	// Register transcription adapters
-	registry.RegisterTranscriptionAdapter("whisperx",
-		adapters.NewWhisperXAdapter(cfg.WhisperXEnv))
-	registry.RegisterTranscriptionAdapter("parakeet",
-		adapters.NewParakeetAdapter(nvidiaEnvPath))
-	registry.RegisterTranscriptionAdapter("canary",
-		adapters.NewCanaryAdapter(nvidiaEnvPath)) // Shares with Parakeet
-	registry.RegisterTranscriptionAdapter("voxtral",
-		adapters.NewVoxtralAdapter(voxtralEnvPath))
-	registry.RegisterTranscriptionAdapter("openai_whisper",
-		adapters.NewOpenAIAdapter(cfg.OpenAIAPIKey))
+	if cfg.AdapterEnabled("whisperx") {
+		registry.RegisterTranscriptionAdapter("whisperx",
+			adapters.NewWhisperXAdapter(cfg.WhisperXEnv))
+	}
+	if cfg.AdapterEnabled("parakeet") {
+		registry.RegisterTranscriptionAdapter("parakeet",
+			adapters.NewParakeetAdapter(nvidiaEnvPath))
+	}
+	if cfg.AdapterEnabled("canary") {
+		registry.RegisterTranscriptionAdapter("canary",
+			adapters.NewCanaryAdapter(nvidiaEnvPath)) // Shares with Parakeet
+	}
+	if cfg.AdapterEnabled("voxtral") {
+		registry.RegisterTranscriptionAdapter("voxtral",
+			adapters.NewVoxtralAdapter(voxtralEnvPath))
+	}
+	if cfg.AdapterEnabled("openai_whisper") {
+		registry.RegisterTranscriptionAdapter("openai_whisper",
+			adapters.NewOpenAIAdapter(cfg.OpenAIAPIKey))
+	}
 
 	// Register diarization adapters
-	registry.RegisterDiarizationAdapter("pyannote",
-		adapters.NewPyAnnoteAdapter(pyannoteEnvPath)) // Dedicated environment
-	registry.RegisterDiarizationAdapter("sortformer",
-		adapters.NewSortformerAdapter(nvidiaEnvPath)) // Shares with Parakeet
+	if cfg.AdapterEnabled("pyannote") {
+		registry.RegisterDiarizationAdapter("pyannote",
+			adapters.NewPyAnnoteAdapter(pyannoteEnvPath)) // Dedicated environment
+	}
+	if cfg.AdapterEnabled("sortformer") {
+		registry.RegisterDiarizationAdapter("sortformer",
+			adapters.NewSortformerAdapter(nvidiaEnvPath)) // Shares with Parakeet
+	}
 
 	logger.Info("Adapter registration complete")
 }

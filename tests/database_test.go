@@ -2,6 +2,7 @@ package tests
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"scriberr/internal/database"
@@ -53,8 +54,11 @@ func (suite *DatabaseTestSuite) TestDatabaseInitialization() {
 
 // Test database initialization with invalid path
 func (suite *DatabaseTestSuite) TestDatabaseInitializationInvalidPath() {
-	// Try to initialize with an invalid path (directory doesn't exist and can't be created)
-	invalidPath := "/root/nonexistent/database.db"
+	// Try to initialize with an invalid path (directory can't be created because its parent
+	// is a regular file). "/root/..." is writable on Windows and would create C:\root.
+	blocker := filepath.Join(suite.T().TempDir(), "not-a-dir")
+	assert.NoError(suite.T(), os.WriteFile(blocker, nil, 0600))
+	invalidPath := filepath.Join(blocker, "nonexistent", "database.db")
 
 	// This might fail depending on permissions, but we'll test what we can
 	err := database.Initialize(invalidPath)

@@ -55,7 +55,7 @@ def transcribe_audio(
 
     # Apply the new decoding strategy (this rebuilds the decoder with our config)
     asr_model.change_decoding_strategy(dec_cfg)
-    print("✓ CUDA graphs disabled successfully")
+    print("CUDA graphs disabled successfully")
 
     # Configure for long-form audio if context sizes are not default
     if context_left != 256 or context_right != 256:
